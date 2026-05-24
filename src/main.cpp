@@ -13,6 +13,7 @@
 #include "device.h"        // forfun::createDevice / destroyDevice
 #include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
 #include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
+#include "vk_helpers.h"    // transitionImage
 #include "types.h"         // VK_CHECK, kFramesInFlight
 
 #include <array>
@@ -101,12 +102,103 @@ int main() {
                 kFramesInFlight);
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
+    // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
+    // clear actually happened (vs. driver-default black).
+    constexpr VkClearColorValue kClearColor = {{0.95f, 0.82f, 0.78f, 1.0f}};
+
+    uint32_t frameIndex = 0;
     while (!glfwWindowShouldClose(window)) {
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
         }
+
+        forfun::FrameContext& frame = frames[frameIndex];
+
+        // 1. Wait for the previous use of this frame slot to finish.
+        VK_CHECK(vkWaitForFences(gpu.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences  (gpu.device, 1, &frame.inFlight));
+
+        // 2. Acquire a swapchain image; the imageAvailable semaphore signals
+        //    once the presentation engine releases it.
+        uint32_t imageIndex = 0;
+        VK_CHECK(vkAcquireNextImageKHR(gpu.device, sc.swapchain, UINT64_MAX,
+                                       frame.imageAvailable, VK_NULL_HANDLE, &imageIndex));
+
+        // 3. Record commands: transition to color-attachment, clear via
+        //    dynamic rendering, transition to present-src.
+        VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
+        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(frame.cmd, &beginInfo));
+
+        transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+        VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttachment.imageView          = sc.imageViews[imageIndex];
+        colorAttachment.imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp             = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color   = kClearColor;
+
+        VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        renderingInfo.renderArea           = {{0, 0}, sc.extent};
+        renderingInfo.layerCount           = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments    = &colorAttachment;
+
+        vkCmdBeginRendering(frame.cmd, &renderingInfo);
+        // (terrain draws go here in A1.terrain.7)
+        vkCmdEndRendering(frame.cmd);
+
+        transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT, 0);
+
+        VK_CHECK(vkEndCommandBuffer(frame.cmd));
+
+        // 4. Submit: wait on imageAvailable, signal renderFinished + fence.
+        VkCommandBufferSubmitInfo cbSubmit{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+        cbSubmit.commandBuffer = frame.cmd;
+
+        VkSemaphoreSubmitInfo waitSem{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        waitSem.semaphore = frame.imageAvailable;
+        waitSem.stageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT;
+
+        VkSemaphoreSubmitInfo signalSem{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+        signalSem.semaphore = frame.renderFinished;
+        signalSem.stageMask = VK_PIPELINE_STAGE_2_ALL_GRAPHICS_BIT;
+
+        VkSubmitInfo2 submitInfo{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+        submitInfo.waitSemaphoreInfoCount   = 1;
+        submitInfo.pWaitSemaphoreInfos      = &waitSem;
+        submitInfo.signalSemaphoreInfoCount = 1;
+        submitInfo.pSignalSemaphoreInfos    = &signalSem;
+        submitInfo.commandBufferInfoCount   = 1;
+        submitInfo.pCommandBufferInfos      = &cbSubmit;
+
+        VK_CHECK(vkQueueSubmit2(gpu.graphicsQueue, 1, &submitInfo, frame.inFlight));
+
+        // 5. Present.
+        VkPresentInfoKHR presentInfo{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
+        presentInfo.waitSemaphoreCount = 1;
+        presentInfo.pWaitSemaphores    = &frame.renderFinished;
+        presentInfo.swapchainCount     = 1;
+        presentInfo.pSwapchains        = &sc.swapchain;
+        presentInfo.pImageIndices      = &imageIndex;
+        VK_CHECK(vkQueuePresentKHR(gpu.graphicsQueue, &presentInfo));
+
+        frameIndex = (frameIndex + 1) % kFramesInFlight;
     }
+
+    // Make sure the GPU is idle before tearing down resources still in use.
+    VK_CHECK(vkDeviceWaitIdle(gpu.device));
 
     for (auto& f : frames) forfun::destroyFrameContext(gpu, f);
     forfun::destroySwapchain(gpu, sc);

@@ -50,19 +50,35 @@ loop) are unblocked.
 
 ## Phase 1 — Terrain MVP (Matterhorn)
 
+CPU pipeline first (loader → frame → mesh), then GPU plumbing (render loop →
+mesh upload → depth → camera), then actual terrain rendering (shader → camera
+controls → final scene).
+
+### Phase 1a — CPU pipeline (DONE)
+
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
 | A1.terrain.1  | GeoTIFF loader (libtiff + zlib via CPM; tiled+scanline; uint32_t counts)   | DONE   |
 | A1.terrain.2  | Auto-download Copernicus GLO-30 Matterhorn tile (~30 MB from AWS Open Data) | DONE  |
 | A1.terrain.3  | Local ENU frame (centred on tile midpoint; metres-per-degree precomputed)  | DONE   |
 | A1.terrain.4  | Heightmap → triangle mesh (configurable stride; central-difference normals) | DONE  |
-| A1.terrain.5  | Terrain `.mat` (slope/height debug shading; reuses existing PBR plumbing)  | TODO   |
-| A1.terrain.6  | Orbit camera (target = summit) + fly mode toggle                           | TODO   |
-| A1.terrain.7  | Render Matterhorn, tone-mapped, with sky                                   | TODO   |
 
-A1.terrain.5–7 are blocked on Phase 0B (extracting Engine / Device / Swapchain
-/ FrameContext from `helmet_demo`'s `main.cpp` so alpine-sun can drive a
-render loop).
+### Phase 1b — GPU plumbing (in progress)
+
+| ID            | Description                                                                | Status |
+|---------------|----------------------------------------------------------------------------|--------|
+| A1.render.0   | Render-loop skeleton: acquire → record → submit → present, clear-color only | DONE  |
+| A1.render.1   | Depth attachment + dynamic-rendering depth state                           | TODO   |
+| A1.render.2   | Upload terrain vertex + index buffers to GPU (staging via vk_helpers)      | TODO   |
+| A1.render.3   | Camera UBO + descriptor set (view + projection matrices)                   | TODO   |
+
+### Phase 1c — Terrain rendering
+
+| ID            | Description                                                                | Status |
+|---------------|----------------------------------------------------------------------------|--------|
+| A1.terrain.5  | Terrain shader: start with hand-written GLSL (slope/height debug), revisit .mat once PBR is wanted | TODO |
+| A1.terrain.6  | Orbit camera (target = summit) + fly mode toggle (GLFW input → camera)     | TODO   |
+| A1.terrain.7  | Render Matterhorn end-to-end, depth-tested, with sky backdrop              | TODO   |
 
 ## Phase 2 — Sun positioning
 
