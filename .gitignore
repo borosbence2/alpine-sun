@@ -4,3 +4,6 @@ build/
 *.suo
 out/
 CMakeUserPresets.json
+
+# Downloaded test data (auto-fetched by CMake at configure time)
+assets/dem/

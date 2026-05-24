@@ -46,13 +46,17 @@ alpine-sun's terrain MVP actually needs.
 
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
-| A1.terrain.1  | GeoTIFF loader (libtiff, not GDAL — avoid the heavy stack)                 | TODO   |
-| A1.terrain.2  | Load one Copernicus GLO-30 tile covering Matterhorn                        | TODO   |
-| A1.terrain.3  | Coordinate system: UTM zone → local ENU frame; document conventions        | TODO   |
-| A1.terrain.4  | Heightmap → triangle mesh (CPU regular grid, no LOD yet)                   | TODO   |
+| A1.terrain.1  | GeoTIFF loader (libtiff + zlib via CPM; tiled+scanline; uint32_t counts)   | DONE   |
+| A1.terrain.2  | Auto-download Copernicus GLO-30 Matterhorn tile (~30 MB from AWS Open Data) | DONE  |
+| A1.terrain.3  | Local ENU frame (centred on tile midpoint; metres-per-degree precomputed)  | DONE   |
+| A1.terrain.4  | Heightmap → triangle mesh (configurable stride; central-difference normals) | DONE  |
 | A1.terrain.5  | Terrain `.mat` (slope/height debug shading; reuses existing PBR plumbing)  | TODO   |
 | A1.terrain.6  | Orbit camera (target = summit) + fly mode toggle                           | TODO   |
 | A1.terrain.7  | Render Matterhorn, tone-mapped, with sky                                   | TODO   |
+
+A1.terrain.5–7 are blocked on Phase 0B (extracting Engine / Device / Swapchain
+/ FrameContext from `helmet_demo`'s `main.cpp` so alpine-sun can drive a
+render loop).
 
 ## Phase 2 — Sun positioning
 
