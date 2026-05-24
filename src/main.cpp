@@ -1,15 +1,17 @@
 // alpine-sun — entry point.
 //
-// Phase 1 in progress. On startup, loads the Matterhorn DEM tile and prints
-// its metadata as a smoke test for the GeoTIFF loader (A1.terrain.1). Opens a
-// window and runs an empty event loop; rendering arrives once engine
-// primitives are extracted from helmet_demo in Phase 0B.
+// Phase 1 in progress. On startup, loads the Matterhorn DEM tile, generates
+// a terrain mesh, then creates a Vulkan device via forfun_core. Opens a
+// window and runs an empty event loop. Actual rendering arrives once the
+// rest of Phase 0B is extracted (Swapchain, FrameContext).
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #include "dem_loader.h"
 #include "terrain_mesh.h"
+#include "device.h"     // forfun::createDevice / destroyDevice
+#include "types.h"      // VK_CHECK
 
 #include <cstdio>
 #include <cstdlib>
@@ -69,6 +71,16 @@ int main() {
         return EXIT_FAILURE;
     }
 
+    forfun::Device gpu = forfun::createDevice({
+        .appName          = "alpine-sun",
+        .enableValidation = true,
+        .createSurface    = [window](VkInstance inst) {
+            VkSurfaceKHR s = VK_NULL_HANDLE;
+            VK_CHECK(glfwCreateWindowSurface(inst, window, nullptr, &s));
+            return s;
+        },
+    });
+    std::printf("vulkan: device created, graphicsFamily=%u\n", gpu.graphicsFamily);
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
     while (!glfwWindowShouldClose(window)) {
@@ -78,6 +90,7 @@ int main() {
         }
     }
 
+    forfun::destroyDevice(gpu);
     glfwDestroyWindow(window);
     glfwTerminate();
     return EXIT_SUCCESS;
