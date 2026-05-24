@@ -11,6 +11,7 @@
 #include "dem_loader.h"
 #include "terrain_mesh.h"
 #include "device.h"     // forfun::createDevice / destroyDevice
+#include "swapchain.h"  // forfun::createSwapchain / destroySwapchain
 #include "types.h"      // VK_CHECK
 
 #include <cstdio>
@@ -81,6 +82,15 @@ int main() {
         },
     });
     std::printf("vulkan: device created, graphicsFamily=%u\n", gpu.graphicsFamily);
+
+    forfun::Swapchain sc = forfun::createSwapchain(gpu, {
+        .desiredExtent      = {1280, 720},
+        .desiredFormat      = VK_FORMAT_B8G8R8A8_SRGB,
+        .desiredColorSpace  = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR,
+        .desiredPresentMode = VK_PRESENT_MODE_FIFO_KHR,
+    });
+    std::printf("vulkan: swapchain created, %ux%u, %zu images\n",
+                sc.extent.width, sc.extent.height, sc.images.size());
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
     while (!glfwWindowShouldClose(window)) {
@@ -90,6 +100,7 @@ int main() {
         }
     }
 
+    forfun::destroySwapchain(gpu, sc);
     forfun::destroyDevice(gpu);
     glfwDestroyWindow(window);
     glfwTerminate();

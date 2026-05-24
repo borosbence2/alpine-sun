@@ -40,7 +40,7 @@ alpine-sun's terrain MVP actually needs.
 | A0.lib.4   | Hide internals: VMA out of public types (PIMPL or detail/), vk-bootstrap stays demo-side | TODO |
 | A0.lib.5   | CMake install + package config so external apps can use `find_package(forfun_core)`  | TODO   |
 | A0.lib.7b.1 | **Device**: instance + surface + physical + logical + queues + VMA (callback-based surface creation) | DONE |
-| A0.lib.7b.2 | **Swapchain**: VkSwapchainKHR + images + image views + extent + format; resize handling | TODO |
+| A0.lib.7b.2 | **Swapchain**: VkSwapchainKHR + images + image views + extent + format (no resize yet) | DONE |
 | A0.lib.7b.3 | **FrameContext**: per-frame command pool + cmd buffer + sync primitives + frames-in-flight ring | TODO |
 | A0.lib.7c  | alpine-sun renders the terrain mesh via the extracted engine primitives              | TODO   |
 
