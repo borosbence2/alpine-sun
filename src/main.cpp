@@ -10,9 +10,12 @@
 
 #include "dem_loader.h"
 #include "terrain_mesh.h"
-#include "device.h"     // forfun::createDevice / destroyDevice
-#include "swapchain.h"  // forfun::createSwapchain / destroySwapchain
-#include "types.h"      // VK_CHECK
+#include "device.h"        // forfun::createDevice / destroyDevice
+#include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
+#include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
+#include "types.h"         // VK_CHECK, kFramesInFlight
+
+#include <array>
 
 #include <cstdio>
 #include <cstdlib>
@@ -91,6 +94,11 @@ int main() {
     });
     std::printf("vulkan: swapchain created, %ux%u, %zu images\n",
                 sc.extent.width, sc.extent.height, sc.images.size());
+
+    std::array<forfun::FrameContext, kFramesInFlight> frames{};
+    for (auto& f : frames) f = forfun::createFrameContext(gpu);
+    std::printf("vulkan: %u frame contexts ready (per-frame cmd pool + sync)\n",
+                kFramesInFlight);
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
     while (!glfwWindowShouldClose(window)) {
@@ -100,6 +108,7 @@ int main() {
         }
     }
 
+    for (auto& f : frames) forfun::destroyFrameContext(gpu, f);
     forfun::destroySwapchain(gpu, sc);
     forfun::destroyDevice(gpu);
     glfwDestroyWindow(window);

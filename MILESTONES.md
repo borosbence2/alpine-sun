@@ -41,8 +41,12 @@ alpine-sun's terrain MVP actually needs.
 | A0.lib.5   | CMake install + package config so external apps can use `find_package(forfun_core)`  | TODO   |
 | A0.lib.7b.1 | **Device**: instance + surface + physical + logical + queues + VMA (callback-based surface creation) | DONE |
 | A0.lib.7b.2 | **Swapchain**: VkSwapchainKHR + images + image views + extent + format (no resize yet) | DONE |
-| A0.lib.7b.3 | **FrameContext**: per-frame command pool + cmd buffer + sync primitives + frames-in-flight ring | TODO |
+| A0.lib.7b.3 | **FrameContext**: per-frame command pool + cmd buffer + sync (image-available, render-finished, in-flight fence). Demos manage their own ring/array. | DONE |
 | A0.lib.7c  | alpine-sun renders the terrain mesh via the extracted engine primitives              | TODO   |
+
+**Phase 0B is functionally complete.** alpine-sun now has Device + Swapchain +
+FrameContext via `forfun_core`. A1.terrain.5–7 (terrain shader, camera, render
+loop) are unblocked.
 
 ## Phase 1 — Terrain MVP (Matterhorn)
 
