@@ -23,7 +23,7 @@
 
 namespace {
 
-void smokeTestPipeline() {
+terrain::Mesh loadAndBuildTerrain() {
     dem::Tile tile;
     const char* path = ALPINE_SUN_MATTERHORN_TILE_PATH;
     std::printf("dem: loading %s\n", path);
@@ -45,7 +45,7 @@ void smokeTestPipeline() {
     // to regenerate while iterating. Drop to stride=1 for full GLO-30 detail.
     terrain::MeshOptions opts;
     opts.stride = 8;
-    const terrain::Mesh mesh = terrain::makeMesh(tile, opts);
+    terrain::Mesh mesh = terrain::makeMesh(tile, opts);
     std::printf("mesh: %zu verts, %zu tris, stride=%u\n",
                 mesh.vertices.size(), mesh.indices.size() / 3, opts.stride);
     std::printf("mesh: AABB min=(%.0f, %.0f, %.0f) max=(%.0f, %.0f, %.0f) m\n",
@@ -54,12 +54,13 @@ void smokeTestPipeline() {
     std::printf("mesh: ENU origin lon=%.4f lat=%.4f, m/deg lon=%.1f lat=%.1f\n",
                 mesh.frame.centerLon, mesh.frame.centerLat,
                 mesh.frame.metresPerDegreeLon, mesh.frame.metresPerDegreeLat);
+    return mesh;
 }
 
 } // namespace
 
 int main() {
-    smokeTestPipeline();
+    terrain::Mesh mesh = loadAndBuildTerrain();
 
     if (!glfwInit()) {
         std::fprintf(stderr, "glfwInit failed\n");
@@ -100,6 +101,64 @@ int main() {
     for (auto& f : frames) f = forfun::createFrameContext(gpu);
     std::printf("vulkan: %u frame contexts ready (per-frame cmd pool + sync)\n",
                 kFramesInFlight);
+
+    // ---- Depth attachment ----
+    DepthImage depth = createDepthImage(gpu.allocator, gpu.device, sc.extent,
+                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+
+    // ---- Transient pool for one-time uploads + depth transition ----
+    VkCommandPool uploadPool = VK_NULL_HANDLE;
+    {
+        VkCommandPoolCreateInfo poolCi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        poolCi.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+        poolCi.queueFamilyIndex = gpu.graphicsFamily;
+        VK_CHECK(vkCreateCommandPool(gpu.device, &poolCi, nullptr, &uploadPool));
+    }
+
+    // Depth image lives in DEPTH_ATTACHMENT_OPTIMAL for its whole lifetime.
+    // CLEAR loadOp handles the per-frame reset to far plane, so we don't need
+    // to transition it again.
+    {
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = uploadPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &begin));
+        transitionImage(cmd, depth.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                        VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        VK_CHECK(vkEndCommandBuffer(cmd));
+
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
+    }
+
+    // ---- Upload terrain VB + IB ----
+    const VkDeviceSize vbBytes = sizeof(Vertex)   * mesh.vertices.size();
+    const VkDeviceSize ibBytes = sizeof(uint32_t) * mesh.indices.size();
+    Buffer terrainVB = createBufferGPU(gpu.allocator, vbBytes,
+        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer terrainIB = createBufferGPU(gpu.allocator, ibBytes,
+        VK_BUFFER_USAGE_INDEX_BUFFER_BIT  | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    uploadToBuffer(gpu.device, gpu.graphicsQueue, uploadPool, gpu.allocator,
+                   mesh.vertices.data(), vbBytes, terrainVB.buffer);
+    uploadToBuffer(gpu.device, gpu.graphicsQueue, uploadPool, gpu.allocator,
+                   mesh.indices.data(),  ibBytes, terrainIB.buffer);
+    vkDestroyCommandPool(gpu.device, uploadPool, nullptr);
+    std::printf("gpu: terrain uploaded — VB %.1f MB, IB %.1f MB\n",
+                vbBytes / (1024.0 * 1024.0), ibBytes / (1024.0 * 1024.0));
+
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
     // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
@@ -145,11 +204,19 @@ int main() {
         colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_STORE;
         colorAttachment.clearValue.color   = kClearColor;
 
+        VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depthAttachment.imageView                  = depth.view;
+        depthAttachment.imageLayout                = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp                     = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp                    = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil    = {1.0f, 0};
+
         VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
         renderingInfo.renderArea           = {{0, 0}, sc.extent};
         renderingInfo.layerCount           = 1;
         renderingInfo.colorAttachmentCount = 1;
         renderingInfo.pColorAttachments    = &colorAttachment;
+        renderingInfo.pDepthAttachment     = &depthAttachment;
 
         vkCmdBeginRendering(frame.cmd, &renderingInfo);
         // (terrain draws go here in A1.terrain.7)
@@ -200,6 +267,10 @@ int main() {
     // Make sure the GPU is idle before tearing down resources still in use.
     VK_CHECK(vkDeviceWaitIdle(gpu.device));
 
+    vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
+    vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
+    vkDestroyImageView(gpu.device, depth.view, nullptr);
+    vmaDestroyImage(gpu.allocator, depth.image, depth.allocation);
     for (auto& f : frames) forfun::destroyFrameContext(gpu, f);
     forfun::destroySwapchain(gpu, sc);
     forfun::destroyDevice(gpu);

@@ -68,8 +68,8 @@ controls → final scene).
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
 | A1.render.0   | Render-loop skeleton: acquire → record → submit → present, clear-color only | DONE  |
-| A1.render.1   | Depth attachment + dynamic-rendering depth state                           | TODO   |
-| A1.render.2   | Upload terrain vertex + index buffers to GPU (staging via vk_helpers)      | TODO   |
+| A1.render.1   | Depth attachment (transitioned once to DEPTH_OPTIMAL; CLEAR loadOp per frame) | DONE |
+| A1.render.2   | Upload terrain VB (6.2 MB) + IB (4.6 MB) via staging (uploadToBuffer)      | DONE   |
 | A1.render.3   | Camera UBO + descriptor set (view + projection matrices)                   | TODO   |
 
 ### Phase 1c — Terrain rendering
