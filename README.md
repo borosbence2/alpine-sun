@@ -6,9 +6,16 @@ sun/shadow at any time of day — plus sun-hours per day across the region,
 GPX routes draped on the terrain, and optional satellite imagery as the
 albedo.
 
-The headline use case: pick a date, scrub the local hour, and see exactly
-when each face of your peak goes into the sun. Right-click any point to read
+The headline use case: pick a date, set the local hour, and see exactly
+when each face of your peak goes into the sun to help planning the summit windows, and help tracking possible avanalches. Right-click any point to read
 its sun-hours, latitude, longitude and elevation.
+
+<img width="1274" height="740" alt="alpine-sun-1" src="https://github.com/user-attachments/assets/f693932e-8ee6-4af2-a465-59a4f7754f4c" />
+
+<img width="1275" height="754" alt="alpine-sun-3" src="https://github.com/user-attachments/assets/1ebd9451-24d9-4142-a278-fdfb07ef0e46" />
+
+<img width="1273" height="745" alt="alpine-sun-2" src="https://github.com/user-attachments/assets/b9410f46-c484-4508-bb2f-9429226ab4f9" />
+
 
 ---
 
