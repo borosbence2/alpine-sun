@@ -112,7 +112,7 @@ positioning via NREL SPA) is the next substantive milestone.
 | A4.heat.1   | `sun_hours.comp` accumulates sun-hours-per-day per output texel. CPU-side fills a UBO with 144 sun directions (10-min steps via PSA); GPU loops them and reads the horizon map for each direction. R32F 512² accumulator. | DONE |
 | A4.heat.2   | `viridis()` polynomial colormap in `terrain.frag`; when "Show colormap" is on, the terrain reads as sun-hours with a subtle shape-cue from N.z. | DONE |
 | A4.heat.3   | Auto-recompute whenever lat/lon/year/month/day/tz/step changes — synchronous dispatch (~few ms), invisible to user. | DONE   |
-| A4.heat.4   | Face-selection mode: paint a region, get exact sun-hours/day for it         | TODO   |
+| A4.heat.4   | Right-click on terrain samples that point: depth readback from main pass → unproject via `invViewProj` → world XY → sun-hours texel → second one-texel readback. ImGui panel shows lat/lon/elevation/hours-per-day for the last picked point. Single-point pick rather than region paint — region paint can layer on later. | DONE |
 
 ## Phase 5 — Trip planning features
 

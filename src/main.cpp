@@ -112,6 +112,22 @@ struct ToneUi {
     float exposure = 1.0f;
 };
 
+// Right-click picking. Cleared once the readback completes.
+struct PickRequest {
+    bool pending = false;
+    int  pixelX  = 0;
+    int  pixelY  = 0;
+};
+// Last successful pick — persists in the ImGui panel until replaced.
+struct PickResult {
+    bool      valid     = false;
+    glm::vec3 worldPos  = glm::vec3(0.0f);
+    double    latDeg    = 0.0;
+    double    lonDeg    = 0.0;
+    float     elevation = 0.0f;
+    float     sunHours  = 0.0f;
+};
+
 // Matches the sun_hours.comp UBO layout in std140. The trailing pad keeps
 // the struct size a multiple of 16 bytes so we can sizeof() it directly.
 struct alignas(16) SunSamplesUBO {
@@ -136,6 +152,7 @@ struct OrbitCamera {
 
 struct InputState {
     bool   leftDown      = false;
+    bool   rightDown     = false;
     double lastX         = 0.0;
     double lastY         = 0.0;
     double scrollPending = 0.0;   // GLFW scroll deltas accumulate here; consumed each frame
@@ -149,6 +166,8 @@ SunUi       g_sun;
 ShadowUi    g_shadow;
 SunHoursUi  g_sunHours;
 ToneUi      g_tone;
+PickRequest g_pickRequest;
+PickResult  g_pickResult;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -774,6 +793,14 @@ int main() {
     // ---- SunSamples UBO (host-mapped — rewritten each recompute) ----
     Buffer sunSamplesBuf = createBufferHostMapped(
         gpu.allocator, sizeof(SunSamplesUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    // ---- Picking readback buffers ----
+    // One float each: depth at cursor and sun-hours at picked texel. Host-mapped
+    // so we can read straight from `mapped` after vkQueueWaitIdle.
+    Buffer pickDepthBuf = createBufferHostMapped(
+        gpu.allocator, sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    Buffer pickHoursBuf = createBufferHostMapped(
+        gpu.allocator, sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     // ---- Sun-hours compute pipeline (persistent — re-dispatched on date change) ----
     VkDescriptorSetLayout sunHoursSetLayout = VK_NULL_HANDLE;
@@ -1456,6 +1483,18 @@ int main() {
                                                g_camera.minDistance, g_camera.maxDistance);
                 g_input.scrollPending = 0.0;
             }
+
+            // Right-click anywhere on the terrain triggers a pick. We only
+            // act on the rising edge so holding the button doesn't queue up
+            // repeated reads.
+            const bool rightHeld = !uiCapturesMouse
+                && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_RIGHT) == GLFW_PRESS;
+            if (rightHeld && !g_input.rightDown) {
+                g_pickRequest.pending = true;
+                g_pickRequest.pixelX  = static_cast<int>(mx);
+                g_pickRequest.pixelY  = static_cast<int>(my);
+            }
+            g_input.rightDown = rightHeld;
         }
 
         forfun::FrameContext& frame = frames[frameIndex];
@@ -1549,6 +1588,17 @@ int main() {
             ImGui::SetItemTooltip("Linear multiplier before the ACES tonemap.\n"
                                   "Higher = brighter midtones, faster roll-off into white.\n"
                                   "Does not affect the sun-hours colormap.");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Picked point");
+            ImGui::TextDisabled("(right-click on terrain to sample)");
+            if (g_pickResult.valid) {
+                ImGui::Text("Lat  %9.5f°", g_pickResult.latDeg);
+                ImGui::Text("Lon  %9.5f°", g_pickResult.lonDeg);
+                ImGui::Text("Elev %5.0f m",  g_pickResult.elevation);
+                ImGui::Text("Sun  %5.2f h/day", g_pickResult.sunHours);
+            } else {
+                ImGui::TextDisabled("(no sample yet)");
+            }
         }
         ImGui::End();
 
@@ -1742,6 +1792,43 @@ int main() {
 
         vkCmdEndRendering(frame.cmd);
 
+        // ---- Pick: copy depth at cursor into a host-readable buffer ----
+        // Recorded into the SAME cmd buffer as the frame that produced the
+        // depth values we want. We re-transition back to DEPTH_ATTACHMENT_OPTIMAL
+        // so the persistent layout invariant is preserved (next frame's clear
+        // assumes it).
+        const bool pickThisFrame = g_pickRequest.pending
+            && g_pickRequest.pixelX >= 0
+            && g_pickRequest.pixelY >= 0
+            && static_cast<uint32_t>(g_pickRequest.pixelX) < sc.extent.width
+            && static_cast<uint32_t>(g_pickRequest.pixelY) < sc.extent.height;
+        if (pickThisFrame) {
+            transitionImage(frame.cmd, depth.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_COPY_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT);
+
+            VkBufferImageCopy region{};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+            region.imageSubresource.layerCount = 1;
+            region.imageOffset = {g_pickRequest.pixelX, g_pickRequest.pixelY, 0};
+            region.imageExtent = {1, 1, 1};
+            vkCmdCopyImageToBuffer(frame.cmd, depth.image,
+                                   VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                   pickDepthBuf.buffer, 1, &region);
+
+            transitionImage(frame.cmd, depth.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_COPY_BIT,
+                            VK_ACCESS_2_TRANSFER_READ_BIT,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        }
+
         transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
                         VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR,
                         VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -1781,6 +1868,101 @@ int main() {
         presentInfo.pImageIndices      = &imageIndex;
         VK_CHECK(vkQueuePresentKHR(gpu.graphicsQueue, &presentInfo));
 
+        // ---- Pick: complete the readback now that the depth copy has been
+        // submitted with the rest of the frame. A queue wait is overkill but
+        // simple, and a click is a one-shot event so a brief stall is fine.
+        if (pickThisFrame) {
+            VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+            float depthValue = 0.0f;
+            std::memcpy(&depthValue, pickDepthBuf.mapped, sizeof(float));
+
+            if (depthValue >= 0.999f) {
+                // Far plane = clicked on sky; nothing to report.
+                g_pickRequest.pending = false;
+            } else {
+                // Unproject NDC → world. Vulkan: framebuffer Y goes down, NDC Y
+                // also goes down post-viewport, so the y-flip is already baked
+                // into the proj matrix we used to render.
+                const float ndcX = (2.0f * (g_pickRequest.pixelX + 0.5f) / sc.extent.width)  - 1.0f;
+                const float ndcY = (2.0f * (g_pickRequest.pixelY + 0.5f) / sc.extent.height) - 1.0f;
+                const glm::vec4 clip(ndcX, ndcY, depthValue, 1.0f);
+                const glm::vec4 worldH = cam.invViewProj * clip;
+                const glm::vec3 worldPos = glm::vec3(worldH) / worldH.w;
+
+                // Map ENU back to lat/lon via the tile's frame.
+                const double lon = mesh.frame.centerLon
+                                 + double(worldPos.x) / mesh.frame.metresPerDegreeLon;
+                const double lat = mesh.frame.centerLat
+                                 + double(worldPos.y) / mesh.frame.metresPerDegreeLat;
+
+                // Compute the sun-hours texel for this point and read it back.
+                const glm::vec2 extent(mesh.aabbMax.x - mesh.aabbMin.x,
+                                       mesh.aabbMax.y - mesh.aabbMin.y);
+                const float uvU = (worldPos.x - mesh.aabbMin.x) / extent.x;
+                const float uvV = (mesh.aabbMax.y - worldPos.y) / extent.y;  // N→S
+                const int texU = std::clamp(int(uvU * float(kSunHoursMapSize)),
+                                            0, int(kSunHoursMapSize) - 1);
+                const int texV = std::clamp(int(uvV * float(kSunHoursMapSize)),
+                                            0, int(kSunHoursMapSize) - 1);
+
+                // Tiny one-shot submit to copy that single texel.
+                VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                cbAi.commandPool        = sunHoursPool;
+                cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                cbAi.commandBufferCount = 1;
+                VkCommandBuffer cmd = VK_NULL_HANDLE;
+                VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+                VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+                transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                                VK_PIPELINE_STAGE_2_COPY_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT);
+
+                VkBufferImageCopy hRegion{};
+                hRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                hRegion.imageSubresource.layerCount = 1;
+                hRegion.imageOffset = {texU, texV, 0};
+                hRegion.imageExtent = {1, 1, 1};
+                vkCmdCopyImageToBuffer(cmd, sunHoursImage,
+                                       VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                       pickHoursBuf.buffer, 1, &hRegion);
+
+                transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                                VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                VK_PIPELINE_STAGE_2_COPY_BIT,
+                                VK_ACCESS_2_TRANSFER_READ_BIT,
+                                VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                                VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+                VK_CHECK(vkEndCommandBuffer(cmd));
+                VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                sub.commandBufferCount = 1;
+                sub.pCommandBuffers    = &cmd;
+                VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+                VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+                vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
+
+                float hoursValue = 0.0f;
+                std::memcpy(&hoursValue, pickHoursBuf.mapped, sizeof(float));
+
+                g_pickResult.valid     = true;
+                g_pickResult.worldPos  = worldPos;
+                g_pickResult.latDeg    = lat;
+                g_pickResult.lonDeg    = lon;
+                g_pickResult.elevation = worldPos.z;
+                g_pickResult.sunHours  = hoursValue;
+                g_pickRequest.pending  = false;
+            }
+        }
+
         frameIndex = (frameIndex + 1) % kFramesInFlight;
     }
 
@@ -1808,6 +1990,8 @@ int main() {
     vkDestroyPipelineLayout(gpu.device, sunHoursPipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, sunHoursDescPool, nullptr);
     vkDestroyDescriptorSetLayout(gpu.device, sunHoursSetLayout, nullptr);
+    vmaDestroyBuffer(gpu.allocator, pickHoursBuf.buffer, pickHoursBuf.allocation);
+    vmaDestroyBuffer(gpu.allocator, pickDepthBuf.buffer, pickDepthBuf.allocation);
     vmaDestroyBuffer(gpu.allocator, sunSamplesBuf.buffer, sunSamplesBuf.allocation);
     vkDestroySampler(gpu.device, sunHoursSampler, nullptr);
     vkDestroyImageView(gpu.device, sunHoursStorageView, nullptr);
