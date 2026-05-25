@@ -7,11 +7,13 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 lightViewProj;
     vec4 sunDirAndIrradiance;  // xyz = TO sun (ENU), w = direct beam W/m²
     vec4 occlusionParams;      // .x = shadow-map enabled, .y = horizon-map enabled
+    vec4 sunHoursParams;       // .x = show colormap, .y = max-hours scale
     vec4 terrainAabb;          // .xy = aabbMin, .zw = aabbMax (xy components only)
 } cam;
 
 layout(set = 0, binding = 1) uniform sampler2D      uShadowMap;
 layout(set = 0, binding = 2) uniform sampler2DArray uHorizonMap;
+layout(set = 0, binding = 3) uniform sampler2D      uSunHours;
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in float vHeight;
@@ -19,11 +21,10 @@ layout(location = 2) in vec3 vWorldPos;
 
 layout(location = 0) out vec4 outColor;
 
-const float TWO_PI = 6.28318530717958647692;
-const float HALF_PI = 1.57079632679;
+const float TWO_PI       = 6.28318530717958647692;
+const float HALF_PI      = 1.57079632679;
 const int   HORIZON_BINS = 32;
 
-// 3×3 PCF over the sun-POV shadow map.
 float sampleShadow(vec4 lightClip) {
     vec3 ndc = lightClip.xyz / lightClip.w;
     if (ndc.z < 0.0 || ndc.z > 1.0) return 1.0;
@@ -47,28 +48,24 @@ float sampleShadow(vec4 lightClip) {
     return lit * (1.0 / 9.0);
 }
 
-// Horizon-map lookup. Compares the sun's elevation to the precomputed
-// maximum-elevation profile of the terrain along the sun's azimuth. Returns
-// visibility ∈ [0, 1].
-float sampleHorizon(vec3 worldPos, vec3 sunDir) {
+// World XY → horizon/sun-hours UV. Both maps share the same convention so we
+// extract this once.
+vec2 worldToHorizonUv(vec3 worldPos) {
     vec2 aabbMin = cam.terrainAabb.xy;
     vec2 aabbMax = cam.terrainAabb.zw;
-    vec2 extent  = aabbMax - aabbMin;
+    return vec2((worldPos.x - aabbMin.x) / (aabbMax.x - aabbMin.x),
+                (aabbMax.y - worldPos.y) / (aabbMax.y - aabbMin.y));
+}
 
-    // Map world XY → horizon UV. Mirrors the bake-time convention exactly
-    // (v=0 at maxY, growing south).
-    vec2 uv = vec2((worldPos.x - aabbMin.x) / extent.x,
-                   (aabbMax.y - worldPos.y) / extent.y);
+float sampleHorizon(vec3 worldPos, vec3 sunDir) {
+    vec2 uv = worldToHorizonUv(worldPos);
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
         return 1.0;
     }
 
-    // Sun azimuth measured from +Y (north) clockwise — matches the bake.
-    // atan(x, y) gives the angle of (x, y) measured from +Y clockwise.
     float az = atan(sunDir.x, sunDir.y);
     if (az < 0.0) az += TWO_PI;
 
-    // Linear blend between the two adjacent bins, treated as continuous.
     float binFloat = az / TWO_PI * float(HORIZON_BINS);
     int   bin0     = int(floor(binFloat)) % HORIZON_BINS;
     int   bin1     = (bin0 + 1) % HORIZON_BINS;
@@ -79,16 +76,43 @@ float sampleHorizon(vec3 worldPos, vec3 sunDir) {
     float horizonAngle = mix(h0, h1, frac);
 
     float sunElev = asin(clamp(sunDir.z, -1.0, 1.0));
-    // ±2° smoothstep band gives a soft horizon line. Tighter than this and
-    // the transition looks like a binary mask along ridges; much wider and
-    // shadows lose their shape.
-    const float kBand = 0.0349;  // 2° in radians
+    const float kBand = 0.0349;  // 2° smoothstep band
     return smoothstep(-kBand, kBand, sunElev - horizonAngle);
+}
+
+// Polynomial viridis approximation by Matt Zucker — visually indistinguishable
+// from matplotlib's lookup at this scale, no LUT texture required.
+vec3 viridis(float t) {
+    t = clamp(t, 0.0, 1.0);
+    const vec3 c0 = vec3(0.2777273272234177,  0.005407344544966578, 0.3340998053353061);
+    const vec3 c1 = vec3(0.1050930431085774,  1.404613529898575,    1.384590162594685);
+    const vec3 c2 = vec3(-0.3308618287255563, 0.214847559468213,    0.09509516302823659);
+    const vec3 c3 = vec3(-4.634230498983486, -5.799100973351585,   -19.33244095627987);
+    const vec3 c4 = vec3(6.228269936347081,  14.17993336680509,    56.69055260068105);
+    const vec3 c5 = vec3(4.776384997670288, -13.74514537774601,   -65.35303263337234);
+    const vec3 c6 = vec3(-5.435455855934631, 4.645852612178535,    26.3124352495832);
+    return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
 }
 
 void main() {
     vec3 N = normalize(vNormal);
 
+    // --- Sun-hours visualisation mode ---
+    // When enabled, the whole terrain reads as a viridis-mapped sun-hours/day.
+    // We still apply a touch of Lambert so the shape stays legible, but the
+    // dominant signal is the colormap.
+    if (cam.sunHoursParams.x > 0.5) {
+        vec2 uv = worldToHorizonUv(vWorldPos);
+        float hours = texture(uSunHours, uv).r;
+        float maxH  = max(cam.sunHoursParams.y, 0.001);
+        vec3  col   = viridis(hours / maxH);
+        // Light shape cue: 0.85..1.0 multiplier from upward-facing-ness.
+        float shape = mix(0.85, 1.0, max(0.0, N.z));
+        outColor = vec4(col * shape, 1.0);
+        return;
+    }
+
+    // --- Normal terrain shading ---
     float slope = clamp(1.0 - N.z, 0.0, 1.0);
     float h     = clamp((vHeight - 500.0) / 4000.0, 0.0, 1.0);
 
@@ -104,10 +128,6 @@ void main() {
     float ndotl  = max(0.0, dot(N, sunDir));
     float aboveHorizon = smoothstep(-0.05, 0.10, sunDir.z);
 
-    // Combine the two occlusion techniques: each contributes a visibility
-    // factor in [0, 1] and we take the min (any source that says "shaded"
-    // wins). When a source is disabled, its factor is 1.0 so it doesn't bias
-    // the result.
     float vShadow  = cam.occlusionParams.x > 0.5
                    ? sampleShadow(cam.lightViewProj * vec4(vWorldPos, 1.0))
                    : 1.0;

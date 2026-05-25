@@ -130,6 +130,7 @@ add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain.vert"       t
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain.frag"       terrain_frag_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/terrain_depth.vert" terrain_depth_vert_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/horizon_map.comp"   horizon_map_comp_spv)
+add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sun_hours.comp"     sun_hours_comp_spv)
 
 if(MSVC)
     target_compile_options(alpine_sun PRIVATE /W4 /permissive-)

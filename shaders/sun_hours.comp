@@ -1,0 +1,75 @@
+#version 450
+
+// Sun-hours-per-day accumulator. For each output texel (a world XY position)
+// we loop through a precomputed array of sun directions covering one calendar
+// day at fine time steps, look up the horizon-map visibility for each, and
+// accumulate hours of direct sun.
+//
+// The horizon map already does the heavy lifting (terrain occlusion is O(1)
+// per direction). This shader just sweeps time.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+const int   MAX_SUN_SAMPLES = 256;
+const int   HORIZON_BINS    = 32;
+const float TWO_PI          = 6.28318530717958647692;
+
+layout(set = 0, binding = 0) uniform sampler2DArray uHorizonMap;
+layout(set = 0, binding = 1, r32f) uniform image2D uSunHours;
+
+// Each sample's .xyz = unit direction to the sun in ENU (matching the
+// horizon-map azimuth convention); .w currently unused. Below-horizon samples
+// are passed through unmodified — we filter them per-thread.
+layout(set = 0, binding = 2) uniform SunSamples {
+    vec4 dirs[MAX_SUN_SAMPLES];
+    int  count;
+    float hoursPerStep;     // constant across the day (regular sampling)
+    float _pad0;
+    float _pad1;
+} samples;
+
+layout(push_constant) uniform Push {
+    vec4 aabbMinMax;        // .xy = aabbMin, .zw = aabbMax (xy only)
+} pc;
+
+// Linear blend between the two adjacent horizon bins for a given sun direction.
+// Mirrors terrain.frag's sampleHorizon() — kept inline to avoid an #include.
+float horizonAngleAtAzimuth(vec2 uv, float az) {
+    float binF = az / TWO_PI * float(HORIZON_BINS);
+    int   b0   = int(floor(binF)) % HORIZON_BINS;
+    int   b1   = (b0 + 1) % HORIZON_BINS;
+    float frac = fract(binF);
+    float h0   = texture(uHorizonMap, vec3(uv, float(b0))).r;
+    float h1   = texture(uHorizonMap, vec3(uv, float(b1))).r;
+    return mix(h0, h1, frac);
+}
+
+void main() {
+    ivec2 gid     = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 outSize = imageSize(uSunHours);
+    if (gid.x >= outSize.x || gid.y >= outSize.y) return;
+
+    // Output texel centre → horizon-map UV. Same convention as the horizon
+    // bake: u grows east, v grows south.
+    vec2 uv = (vec2(gid) + 0.5) / vec2(outSize);
+
+    float accum = 0.0;
+    for (int i = 0; i < samples.count; ++i) {
+        vec3 sunDir = samples.dirs[i].xyz;
+        if (sunDir.z <= 0.0) continue;  // sun below horizon — no contribution
+
+        float az = atan(sunDir.x, sunDir.y);
+        if (az < 0.0) az += TWO_PI;
+        float horizonAngle = horizonAngleAtAzimuth(uv, az);
+        float sunElev      = asin(clamp(sunDir.z, -1.0, 1.0));
+
+        // Same soft cutoff as terrain.frag — a few-degree band makes the
+        // visualisation read smoothly along ridge edges where the sun
+        // skims for only a moment.
+        const float kBand = 0.0349;  // 2°
+        float vis = smoothstep(-kBand, kBand, sunElev - horizonAngle);
+        accum += vis * samples.hoursPerStep;
+    }
+
+    imageStore(uSunHours, gid, vec4(accum, 0.0, 0.0, 0.0));
+}

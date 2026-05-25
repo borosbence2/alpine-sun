@@ -26,6 +26,7 @@
 #include "terrain.frag.h"
 #include "terrain_depth.vert.h"
 #include "horizon_map.comp.h"
+#include "sun_hours.comp.h"
 
 #include <algorithm>
 #include <array>
@@ -51,6 +52,7 @@ struct alignas(16) CameraUBO {
     glm::mat4 lightViewProj;
     glm::vec4 sunDirAndIrradiance;
     glm::vec4 occlusionParams;       // .x = shadow-map enabled, .y = horizon-map enabled
+    glm::vec4 sunHoursParams;        // .x = show sun-hours colormap, .y = max-hours scale
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
@@ -89,6 +91,29 @@ constexpr uint32_t kHorizonBins    = 32;
 constexpr float    kHorizonStepDistMeters = 150.0f;
 constexpr int      kHorizonMaxSteps       = 128;
 
+// Sun-hours-per-day visualisation. Output image matches the horizon map's
+// XY layout so the terrain frag can reuse the same UV mapping. Compute time
+// scales with kMaxSunSamples; 256 is comfortably enough for 5-min steps
+// across 24 h while keeping the UBO around 4 KB.
+constexpr uint32_t kSunHoursMapSize = 512;
+constexpr uint32_t kMaxSunSamples   = 256;
+
+struct SunHoursUi {
+    bool  enabled       = false;
+    float stepMinutes   = 10.0f;   // 144 samples/day at the default
+    float maxHoursScale = 14.0f;   // normalises the viridis colormap
+};
+
+// Matches the sun_hours.comp UBO layout in std140. The trailing pad keeps
+// the struct size a multiple of 16 bytes so we can sizeof() it directly.
+struct alignas(16) SunSamplesUBO {
+    glm::vec4 dirs[kMaxSunSamples];
+    int       count;
+    float     hoursPerStep;
+    float     _pad0;
+    float     _pad1;
+};
+
 // Orbit camera: eye orbits around `target` on a sphere of radius `distance`.
 // yaw is the compass angle from +X (east) measured CCW around +Z; pitch is the
 // elevation angle above the horizontal plane through `target`.
@@ -114,6 +139,7 @@ OrbitCamera g_camera;
 InputState  g_input;
 SunUi       g_sun;
 ShadowUi    g_shadow;
+SunHoursUi  g_sunHours;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -177,6 +203,46 @@ glm::mat4 computeLightViewProj(const glm::vec3& sunDir,
                                            lsMin.y, lsMax.y,
                                            -lsMax.z, -lsMin.z);
     return lightProj * lightView;
+}
+
+// Matt Zucker's polynomial viridis fit — same coefficients as the GLSL copy
+// in terrain.frag so the ImGui legend matches the on-terrain colours exactly.
+glm::vec3 viridisCpu(float t) {
+    t = std::clamp(t, 0.0f, 1.0f);
+    const glm::vec3 c0( 0.2777273272234177f,  0.005407344544966578f, 0.3340998053353061f);
+    const glm::vec3 c1( 0.1050930431085774f,  1.404613529898575f,    1.384590162594685f);
+    const glm::vec3 c2(-0.3308618287255563f,  0.214847559468213f,    0.09509516302823659f);
+    const glm::vec3 c3(-4.634230498983486f,  -5.799100973351585f,  -19.33244095627987f);
+    const glm::vec3 c4( 6.228269936347081f,  14.17993336680509f,    56.69055260068105f);
+    const glm::vec3 c5( 4.776384997670288f, -13.74514537774601f,   -65.35303263337234f);
+    const glm::vec3 c6(-5.435455855934631f,   4.645852612178535f,   26.3124352495832f);
+    return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
+}
+
+// Populates `out` with one calendar day's worth of sun directions, sampled
+// every `stepMinutes` from local midnight to midnight. Below-horizon samples
+// (.z < 0) are stored as-is — the compute shader filters them out per thread.
+// Returns the number of populated entries (clamped to kMaxSunSamples).
+int fillSunSamples(SunSamplesUBO& out, const SunUi& sun, float stepMinutes) {
+    const float clampedStep = std::max(1.0f, stepMinutes);
+    int stepsPerDay = static_cast<int>(std::ceil(24.0f * 60.0f / clampedStep));
+    if (stepsPerDay > static_cast<int>(kMaxSunSamples)) stepsPerDay = kMaxSunSamples;
+    const float hoursPerStep = 24.0f / static_cast<float>(stepsPerDay);
+    out.count        = stepsPerDay;
+    out.hoursPerStep = hoursPerStep;
+    out._pad0        = 0.0f;
+    out._pad1        = 0.0f;
+    for (int i = 0; i < stepsPerDay; ++i) {
+        const float localHour = (static_cast<float>(i) + 0.5f) * hoursPerStep;
+        const sun::Sample s   = sun::compute(sun.latDeg, sun.lonDeg,
+                                             sun.year, sun.month, sun.day,
+                                             localHour, sun.tzOffsetH);
+        out.dirs[i] = glm::vec4(s.directionToSun, 0.0f);
+    }
+    for (int i = stepsPerDay; i < static_cast<int>(kMaxSunSamples); ++i) {
+        out.dirs[i] = glm::vec4(0.0f);
+    }
+    return stepsPerDay;
 }
 
 struct LoadedTerrain {
@@ -656,7 +722,240 @@ int main() {
                     static_cast<double>(kHorizonStepDistMeters), kHorizonMaxSteps);
     }
 
-    vkDestroyCommandPool(gpu.device, uploadPool, nullptr);
+    // ---- Sun-hours accumulator (single-layer R32F image) ----
+    VkImage         sunHoursImage      = VK_NULL_HANDLE;
+    VkImageView     sunHoursStorageView= VK_NULL_HANDLE;
+    VkImageView     sunHoursSampleView = VK_NULL_HANDLE;
+    VmaAllocation   sunHoursAlloc      = VK_NULL_HANDLE;
+    VkSampler       sunHoursSampler    = VK_NULL_HANDLE;
+    {
+        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageCi.imageType     = VK_IMAGE_TYPE_2D;
+        imageCi.format        = VK_FORMAT_R32_SFLOAT;
+        imageCi.extent        = {kSunHoursMapSize, kSunHoursMapSize, 1};
+        imageCi.mipLevels     = 1;
+        imageCi.arrayLayers   = 1;
+        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
+        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo allocCi{};
+        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
+                                &sunHoursImage, &sunHoursAlloc, nullptr));
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image            = sunHoursImage;
+        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format           = VK_FORMAT_R32_SFLOAT;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &sunHoursStorageView));
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &sunHoursSampleView));
+
+        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sCi.magFilter    = VK_FILTER_LINEAR;
+        sCi.minFilter    = VK_FILTER_LINEAR;
+        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &sunHoursSampler));
+    }
+
+    // ---- SunSamples UBO (host-mapped — rewritten each recompute) ----
+    Buffer sunSamplesBuf = createBufferHostMapped(
+        gpu.allocator, sizeof(SunSamplesUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+
+    // ---- Sun-hours compute pipeline (persistent — re-dispatched on date change) ----
+    VkDescriptorSetLayout sunHoursSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool      sunHoursDescPool  = VK_NULL_HANDLE;
+    VkDescriptorSet       sunHoursDescSet   = VK_NULL_HANDLE;
+    VkPipelineLayout      sunHoursPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            sunHoursPipeline       = VK_NULL_HANDLE;
+    {
+        VkDescriptorSetLayoutBinding bindings[3]{};
+        bindings[0].binding         = 0;
+        bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding         = 1;
+        bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[2].binding         = 2;
+        bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        bindings[2].descriptorCount = 1;
+        bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslCi.bindingCount = 3;
+        dslCi.pBindings    = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &sunHoursSetLayout));
+
+        VkDescriptorPoolSize poolSizes[3]{};
+        poolSizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        poolSizes[0].descriptorCount = 1;
+        poolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        poolSizes[1].descriptorCount = 1;
+        poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[2].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpCi.maxSets       = 1;
+        dpCi.poolSizeCount = 3;
+        dpCi.pPoolSizes    = poolSizes;
+        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &sunHoursDescPool));
+
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool     = sunHoursDescPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &sunHoursSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &sunHoursDescSet));
+
+        VkDescriptorImageInfo horizonReadInfo{};
+        horizonReadInfo.sampler     = horizonSampler;
+        horizonReadInfo.imageView   = horizonSampleView;
+        horizonReadInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo sunHoursStoreInfo{};
+        sunHoursStoreInfo.imageView   = sunHoursStorageView;
+        sunHoursStoreInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkDescriptorBufferInfo samplesInfo{};
+        samplesInfo.buffer = sunSamplesBuf.buffer;
+        samplesInfo.range  = sizeof(SunSamplesUBO);
+
+        VkWriteDescriptorSet writes[3]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = sunHoursDescSet;
+        writes[0].dstBinding      = 0;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo      = &horizonReadInfo;
+        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet          = sunHoursDescSet;
+        writes[1].dstBinding      = 1;
+        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo      = &sunHoursStoreInfo;
+        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet          = sunHoursDescSet;
+        writes[2].dstBinding      = 2;
+        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[2].descriptorCount = 1;
+        writes[2].pBufferInfo     = &samplesInfo;
+        vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
+
+        VkPushConstantRange pushRange{};
+        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pushRange.size       = sizeof(glm::vec4);  // aabbMinMax
+
+        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plCi.setLayoutCount         = 1;
+        plCi.pSetLayouts            = &sunHoursSetLayout;
+        plCi.pushConstantRangeCount = 1;
+        plCi.pPushConstantRanges    = &pushRange;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &sunHoursPipelineLayout));
+
+        VkShaderModule mod = createShaderModule(gpu.device,
+            sun_hours_comp_spv, sizeof(sun_hours_comp_spv));
+        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = mod;
+        stage.pName  = "main";
+        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpCi.stage  = stage;
+        cpCi.layout = sunHoursPipelineLayout;
+        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &sunHoursPipeline));
+        vkDestroyShaderModule(gpu.device, mod, nullptr);
+    }
+
+    // Dedicated transient pool for sun-hours bakes — survives the program's
+    // lifetime because we re-bake whenever the user changes date/location.
+    VkCommandPool sunHoursPool = VK_NULL_HANDLE;
+    {
+        VkCommandPoolCreateInfo poolCi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        poolCi.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
+                                | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        poolCi.queueFamilyIndex = gpu.graphicsFamily;
+        VK_CHECK(vkCreateCommandPool(gpu.device, &poolCi, nullptr, &sunHoursPool));
+    }
+
+    // Tracks the parameter set baked last time so we only re-dispatch when
+    // something the bake depends on actually changed.
+    struct {
+        float latDeg     = std::numeric_limits<float>::quiet_NaN();
+        float lonDeg     = 0.0f;
+        int   year       = 0;
+        int   month      = 0;
+        int   day        = 0;
+        float tzOffsetH  = 0.0f;
+        float stepMin    = 0.0f;
+        bool initialized = false;
+    } lastBakedParams;
+
+    // Runs the sun-hours compute. Synchronous (waits for the queue) — the
+    // dispatch is small enough (~few ms) that the brief stall is invisible.
+    auto runSunHoursBake = [&]() {
+        SunSamplesUBO* samples = static_cast<SunSamplesUBO*>(sunSamplesBuf.mapped);
+        const int n = fillSunSamples(*samples, g_sun, g_sunHours.stepMinutes);
+
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = sunHoursPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        // Discard previous contents (UNDEFINED) — we overwrite every texel.
+        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sunHoursPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                sunHoursPipelineLayout, 0, 1, &sunHoursDescSet, 0, nullptr);
+
+        glm::vec4 push(mesh.aabbMin.x, mesh.aabbMin.y, mesh.aabbMax.x, mesh.aabbMax.y);
+        vkCmdPushConstants(cmd, sunHoursPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+
+        const uint32_t groupsX = (kSunHoursMapSize + 7) / 8;
+        const uint32_t groupsY = (kSunHoursMapSize + 7) / 8;
+        vkCmdDispatch(cmd, groupsX, groupsY, 1);
+
+        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
+
+        lastBakedParams.latDeg      = g_sun.latDeg;
+        lastBakedParams.lonDeg      = g_sun.lonDeg;
+        lastBakedParams.year        = g_sun.year;
+        lastBakedParams.month       = g_sun.month;
+        lastBakedParams.day         = g_sun.day;
+        lastBakedParams.tzOffsetH   = g_sun.tzOffsetH;
+        lastBakedParams.stepMin     = g_sunHours.stepMinutes;
+        lastBakedParams.initialized = true;
+        std::printf("gpu: sun-hours baked — %d samples × %.1f h step\n",
+                    n, static_cast<double>(samples->hoursPerStep));
+    };
+
+    // Initial bake so the descriptor binding is always backed by valid data.
+    runSunHoursBake();
 
     // ---- Camera UBO + per-frame descriptor sets ----
     std::array<Buffer, kFramesInFlight> cameraUbos{};
@@ -665,11 +964,12 @@ int main() {
                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    // Three bindings in one set:
+    // Four bindings in one set:
     //   b0 = camera UBO (both stages),
     //   b1 = shadow map sampler2D (frag),
-    //   b2 = horizon map sampler2DArray (frag).
-    VkDescriptorSetLayoutBinding setBindings[3]{};
+    //   b2 = horizon map sampler2DArray (frag),
+    //   b3 = sun-hours sampler2D (frag).
+    VkDescriptorSetLayoutBinding setBindings[4]{};
     setBindings[0].binding         = 0;
     setBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     setBindings[0].descriptorCount = 1;
@@ -682,9 +982,13 @@ int main() {
     setBindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     setBindings[2].descriptorCount = 1;
     setBindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    setBindings[3].binding         = 3;
+    setBindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    setBindings[3].descriptorCount = 1;
+    setBindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCi.bindingCount = 3;
+    dslCi.bindingCount = 4;
     dslCi.pBindings    = setBindings;
     VkDescriptorSetLayout cameraSetLayout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &cameraSetLayout));
@@ -693,7 +997,7 @@ int main() {
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFramesInFlight;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * 2;  // shadow + horizon per frame
+    poolSizes[1].descriptorCount = kFramesInFlight * 3;  // shadow + horizon + sun-hours per frame
     VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCi.maxSets       = kFramesInFlight;
     dpCi.poolSizeCount = 2;
@@ -723,7 +1027,12 @@ int main() {
         horizonInfo.imageView   = horizonSampleView;
         horizonInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[3]{};
+        VkDescriptorImageInfo sunHoursInfo{};
+        sunHoursInfo.sampler     = sunHoursSampler;
+        sunHoursInfo.imageView   = sunHoursSampleView;
+        sunHoursInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet writes[4]{};
         writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet          = cameraDescSets[i];
         writes[0].dstBinding      = 0;
@@ -742,7 +1051,13 @@ int main() {
         writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[2].descriptorCount = 1;
         writes[2].pImageInfo      = &horizonInfo;
-        vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
+        writes[3].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[3].dstSet          = cameraDescSets[i];
+        writes[3].dstBinding      = 3;
+        writes[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[3].descriptorCount = 1;
+        writes[3].pImageInfo      = &sunHoursInfo;
+        vkUpdateDescriptorSets(gpu.device, 4, writes, 0, nullptr);
     }
 
     // ---- Terrain pipeline ----
@@ -1083,10 +1398,69 @@ int main() {
             ImGui::Checkbox("Horizon map", &g_shadow.horizonMapEnabled);
             ImGui::SliderFloat("Bias const", &g_shadow.depthBiasConstant, 0.0f, 8.0f, "%.2f");
             ImGui::SliderFloat("Bias slope", &g_shadow.depthBiasSlope,    0.0f, 8.0f, "%.2f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Sun hours / day");
+            ImGui::Checkbox("Show colormap", &g_sunHours.enabled);
+            ImGui::SetItemTooltip("Replace terrain shading with a colormap of total\n"
+                                  "direct-sun hours for the selected date.");
+
+            // Legend strip: only useful when the visualisation is actually on.
+            if (g_sunHours.enabled) {
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const float w     = ImGui::CalcItemWidth();
+                const float h     = 14.0f;
+                const ImVec2 p0   = ImGui::GetCursorScreenPos();
+                const int segs    = 64;
+                for (int i = 0; i < segs; ++i) {
+                    const float t0 = float(i)     / float(segs);
+                    const float t1 = float(i + 1) / float(segs);
+                    const glm::vec3 c = viridisCpu(t0);
+                    const ImU32 col = IM_COL32(
+                        int(c.r * 255.0f), int(c.g * 255.0f), int(c.b * 255.0f), 255);
+                    draw->AddRectFilled(
+                        ImVec2(p0.x + t0 * w, p0.y),
+                        ImVec2(p0.x + t1 * w, p0.y + h),
+                        col);
+                }
+                ImGui::Dummy(ImVec2(w, h));
+                // Three labels under the gradient: 0, mid, max.
+                char left[16], mid[16], right[16];
+                std::snprintf(left,  sizeof(left),  "0 h");
+                std::snprintf(mid,   sizeof(mid),   "%.1f h", g_sunHours.maxHoursScale * 0.5f);
+                std::snprintf(right, sizeof(right), "%.1f h", g_sunHours.maxHoursScale);
+                const float midX   = ImGui::CalcTextSize(mid).x;
+                const float rightX = ImGui::CalcTextSize(right).x;
+                ImGui::TextUnformatted(left);
+                ImGui::SameLine(w * 0.5f - midX * 0.5f);
+                ImGui::TextUnformatted(mid);
+                ImGui::SameLine(w - rightX);
+                ImGui::TextUnformatted(right);
+            }
+
+            ImGui::SliderFloat("Sample step",  &g_sunHours.stepMinutes,   5.0f, 60.0f, "%.0f min");
+            ImGui::SetItemTooltip("How often per day to sample the sun position.\n"
+                                  "Smaller = finer time resolution, slightly slower to recompute.");
+            ImGui::SliderFloat("Top of scale", &g_sunHours.maxHoursScale, 4.0f, 16.0f, "%.1f h");
+            ImGui::SetItemTooltip("Hours-per-day that maps to the brightest yellow.\n"
+                                  "Lower = more contrast at shaded points; higher = covers\n"
+                                  "longer summer days without clipping.");
         }
         ImGui::End();
 
         ImGui::Render();
+
+        // ---- Re-bake sun-hours if any dependent parameter changed ----
+        // Cheap (~few ms) so we just dispatch synchronously whenever the user
+        // slides a date/location/step control.
+        if (lastBakedParams.latDeg    != g_sun.latDeg
+         || lastBakedParams.lonDeg    != g_sun.lonDeg
+         || lastBakedParams.year      != g_sun.year
+         || lastBakedParams.month     != g_sun.month
+         || lastBakedParams.day       != g_sun.day
+         || lastBakedParams.tzOffsetH != g_sun.tzOffsetH
+         || lastBakedParams.stepMin   != g_sunHours.stepMinutes) {
+            runSunHoursBake();
+        }
 
         // ---- Camera matrices from orbit state ----
         const glm::vec3 eye    = orbitEye(g_camera);
@@ -1114,6 +1488,9 @@ int main() {
         cam.occlusionParams = glm::vec4(renderShadows                ? 1.0f : 0.0f,
                                         g_shadow.horizonMapEnabled   ? 1.0f : 0.0f,
                                         0.0f, 0.0f);
+        cam.sunHoursParams = glm::vec4(g_sunHours.enabled ? 1.0f : 0.0f,
+                                       g_sunHours.maxHoursScale,
+                                       0.0f, 0.0f);
         cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
                                     mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
@@ -1308,6 +1685,16 @@ int main() {
     for (auto& b : cameraUbos) vmaDestroyBuffer(gpu.allocator, b.buffer, b.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
+    vkDestroyCommandPool(gpu.device, sunHoursPool, nullptr);
+    vkDestroyPipeline(gpu.device, sunHoursPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, sunHoursPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, sunHoursDescPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, sunHoursSetLayout, nullptr);
+    vmaDestroyBuffer(gpu.allocator, sunSamplesBuf.buffer, sunSamplesBuf.allocation);
+    vkDestroySampler(gpu.device, sunHoursSampler, nullptr);
+    vkDestroyImageView(gpu.device, sunHoursStorageView, nullptr);
+    vkDestroyImageView(gpu.device, sunHoursSampleView,  nullptr);
+    vmaDestroyImage(gpu.allocator, sunHoursImage, sunHoursAlloc);
     vkDestroySampler(gpu.device, horizonSampler, nullptr);
     vkDestroyImageView(gpu.device, horizonStorageView, nullptr);
     vkDestroyImageView(gpu.device, horizonSampleView,  nullptr);

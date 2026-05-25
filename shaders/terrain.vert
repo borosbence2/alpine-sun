@@ -11,6 +11,7 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 lightViewProj;
     vec4 sunDirAndIrradiance;
     vec4 occlusionParams;
+    vec4 sunHoursParams;
     vec4 terrainAabb;
 } cam;
 
