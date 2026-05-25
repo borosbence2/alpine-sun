@@ -1,15 +1,15 @@
 // alpine-sun — entry point.
 //
-// Phase 1c: actually draws the Matterhorn terrain mesh. Camera is hardcoded
-// for now (orbit/fly controls arrive in A1.terrain.6). Slope/height debug
-// shading + placeholder fixed-sun Lambert lighting (real sun via SPA in
-// Phase 2).
+// Phase 2: PSA-driven sun direction wired into the terrain shader, with an
+// ImGui panel for location, date, and time. Camera is still the hand-rolled
+// orbit from Phase 1.
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
 
 #include "dem_loader.h"
 #include "terrain_mesh.h"
+#include "sun_driver.h"
 #include "device.h"        // forfun::createDevice / destroyDevice
 #include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
 #include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
@@ -17,6 +17,10 @@
 #include "types.h"         // VK_CHECK, kFramesInFlight, Vertex, kDepthFormat
 
 #include <glm/gtc/matrix_transform.hpp>
+
+#include <imgui.h>
+#include <backends/imgui_impl_glfw.h>
+#include <backends/imgui_impl_vulkan.h>
 
 #include "terrain.vert.h"
 #include "terrain.frag.h"
@@ -33,11 +37,26 @@ namespace {
 
 // std140-ish camera block. All three matrices are written each frame; the
 // shader uses viewProj, but view+proj are kept for future passes (shadow,
-// horizon precompute) that may want them separately.
+// horizon precompute) that may want them separately. sunDirAndIrradiance is
+// xyz = unit direction TO sun (ENU frame), w = direct-beam W/m² (0 at night).
+// vec4 not vec3+float so std140 packing matches the C++ layout naturally.
 struct alignas(16) CameraUBO {
     glm::mat4 view;
     glm::mat4 proj;
     glm::mat4 viewProj;
+    glm::vec4 sunDirAndIrradiance;
+};
+
+// Inputs to the SunDriver, owned by the UI. Defaults frame the Matterhorn
+// (45.976°N, 7.658°E) at local noon today (CEST = UTC+2 in late May 2026).
+struct SunUi {
+    float latDeg    = 45.976f;
+    float lonDeg    =  7.658f;
+    int   year      = 2026;
+    int   month     =    5;
+    int   day       =   25;
+    float localHour =   12.0f;
+    float tzOffsetH =    2.0f;
 };
 
 // Orbit camera: eye orbits around `target` on a sphere of radius `distance`.
@@ -63,8 +82,14 @@ struct InputState {
 // window in this process, so a singleton is fine.
 OrbitCamera g_camera;
 InputState  g_input;
+SunUi       g_sun;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
+    // ImGui needs to see scroll over its widgets even though it installed its
+    // own handler — when our callback was chained later, ImGui's chain helper
+    // forwards for us. Still skip applying it to the camera when the cursor
+    // is over UI.
+    if (ImGui::GetCurrentContext() && ImGui::GetIO().WantCaptureMouse) return;
     g_input.scrollPending += yoffset;
 }
 
@@ -223,7 +248,8 @@ int main() {
     camBinding.binding         = 0;
     camBinding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     camBinding.descriptorCount = 1;
-    camBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+    // Frag stage too — terrain.frag reads sunDirAndIrradiance from the same UBO.
+    camBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     dslCi.bindingCount = 1;
@@ -359,9 +385,87 @@ int main() {
 
     std::printf("gpu: terrain pipeline ready\n");
 
-    std::printf("alpine-sun: window open. Left-drag to orbit, scroll to zoom, ESC to quit.\n");
+    // ---- ImGui setup ----
+    // Generous pool — ImGui allocates one descriptor per font/texture and a
+    // few more for its internals; helmet_demo's example uses 1000-of-each
+    // and we mirror that to stay future-proof if we ever add image widgets.
+    VkDescriptorPool imguiDescPool = VK_NULL_HANDLE;
+    {
+        VkDescriptorPoolSize imguiPoolSizes[] = {
+            {VK_DESCRIPTOR_TYPE_SAMPLER,                1000},
+            {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, 1000},
+            {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE,          1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,          1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER,   1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER,   1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER,         1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,         1000},
+            {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 1000},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 1000},
+            {VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT,       1000},
+        };
+        VkDescriptorPoolCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        ci.flags         = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
+        ci.maxSets       = 1000u * static_cast<uint32_t>(std::size(imguiPoolSizes));
+        ci.poolSizeCount = static_cast<uint32_t>(std::size(imguiPoolSizes));
+        ci.pPoolSizes    = imguiPoolSizes;
+        VK_CHECK(vkCreateDescriptorPool(gpu.device, &ci, nullptr, &imguiDescPool));
+    }
 
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::StyleColorsDark();
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // Register our scroll callback BEFORE ImGui hooks GLFW so its
+    // `install_callbacks=true` path can chain to ours after handling UI scroll.
     glfwSetScrollCallback(window, scrollCallback);
+    ImGui_ImplGlfw_InitForVulkan(window, true);
+
+    VkPipelineRenderingCreateInfoKHR imguiRendering{
+        VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO_KHR};
+    imguiRendering.colorAttachmentCount    = 1;
+    imguiRendering.pColorAttachmentFormats = &sc.imageFormat;
+    // We draw ImGui inside the same render pass as the terrain (which has
+    // depth bound), so its pipeline must declare a matching depth format
+    // even though ImGui itself never reads/writes depth.
+    imguiRendering.depthAttachmentFormat   = kDepthFormat;
+
+    ImGui_ImplVulkan_InitInfo imguiInit{};
+    imguiInit.Instance                    = gpu.instance;
+    imguiInit.PhysicalDevice              = gpu.physicalDevice;
+    imguiInit.Device                      = gpu.device;
+    imguiInit.QueueFamily                 = gpu.graphicsFamily;
+    imguiInit.Queue                       = gpu.graphicsQueue;
+    imguiInit.DescriptorPool              = imguiDescPool;
+    imguiInit.MinImageCount               = static_cast<uint32_t>(sc.images.size());
+    imguiInit.ImageCount                  = static_cast<uint32_t>(sc.images.size());
+    imguiInit.MSAASamples                 = VK_SAMPLE_COUNT_1_BIT;
+    imguiInit.UseDynamicRendering         = true;
+    imguiInit.PipelineRenderingCreateInfo = imguiRendering;
+    ImGui_ImplVulkan_Init(&imguiInit);
+    if (!ImGui_ImplVulkan_CreateFontsTexture()) {
+        std::fprintf(stderr, "ImGui font upload failed\n");
+        return EXIT_FAILURE;
+    }
+    std::printf("imgui: ready\n");
+
+    // Initial sun position printout — handy for spot-checking PSA against an
+    // almanac without launching the UI. Matterhorn local noon today: expect
+    // elevation in the high 50s/low 60s (late May, ~46°N) and azimuth roughly
+    // south (~180°, slightly east of meridian if before solar noon).
+    {
+        const sun::Sample s = sun::compute(
+            g_sun.latDeg, g_sun.lonDeg,
+            g_sun.year,   g_sun.month, g_sun.day,
+            g_sun.localHour, g_sun.tzOffsetH);
+        std::printf("sun:  %d-%02d-%02d %.2fh @ (%.3f, %.3f) → az=%.2f° el=%.2f° I=%.0f W/m²\n",
+                    g_sun.year, g_sun.month, g_sun.day, g_sun.localHour,
+                    g_sun.latDeg, g_sun.lonDeg,
+                    s.azimuthDeg, s.elevationDeg, s.irradianceWm2);
+    }
+
+    std::printf("alpine-sun: window open. Left-drag to orbit, scroll to zoom, ESC to quit.\n");
 
     // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
     // clear actually happened (vs. driver-default black).
@@ -375,10 +479,15 @@ int main() {
         }
 
         // ---- Input → orbit camera ----
+        // Skip drag-to-orbit when the cursor is over ImGui — otherwise
+        // dragging a slider would also yank the camera. Scroll gating happens
+        // inside scrollCallback.
+        const bool uiCapturesMouse = ImGui::GetIO().WantCaptureMouse;
         {
             double mx = 0.0, my = 0.0;
             glfwGetCursorPos(window, &mx, &my);
-            const bool leftHeld = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+            const bool leftHeld = !uiCapturesMouse
+                && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
 
             if (leftHeld && g_input.leftDown) {
                 const double dx = mx - g_input.lastX;
@@ -450,6 +559,40 @@ int main() {
         renderingInfo.pColorAttachments    = &colorAttachment;
         renderingInfo.pDepthAttachment     = &depthAttachment;
 
+        // ---- ImGui: build the Sun panel for this frame ----
+        ImGui_ImplVulkan_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+
+        const sun::Sample sunSample = sun::compute(
+            g_sun.latDeg, g_sun.lonDeg,
+            g_sun.year,   g_sun.month, g_sun.day,
+            g_sun.localHour, g_sun.tzOffsetH);
+
+        ImGui::SetNextWindowSize(ImVec2(320.0f, 0.0f), ImGuiCond_FirstUseEver);
+        if (ImGui::Begin("Sun")) {
+            ImGui::TextUnformatted("Location");
+            ImGui::DragFloat("Latitude°",  &g_sun.latDeg, 0.01f, -89.0f,  89.0f, "%.4f");
+            ImGui::DragFloat("Longitude°", &g_sun.lonDeg, 0.01f, -180.0f, 180.0f, "%.4f");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Date");
+            ImGui::DragInt("Year",  &g_sun.year,  0.25f, 1970, 2099);
+            ImGui::DragInt("Month", &g_sun.month, 0.05f, 1, 12);
+            ImGui::DragInt("Day",   &g_sun.day,   0.10f, 1, 31);
+            ImGui::Separator();
+            ImGui::TextUnformatted("Time");
+            ImGui::SliderFloat("Local hour", &g_sun.localHour, 0.0f, 24.0f, "%.2f h");
+            ImGui::DragFloat ("UTC offset",  &g_sun.tzOffsetH, 0.25f, -12.0f, 14.0f, "%.2f h");
+            ImGui::Separator();
+            ImGui::Text("Azimuth     %6.2f°", sunSample.azimuthDeg);
+            ImGui::Text("Elevation   %6.2f°", sunSample.elevationDeg);
+            ImGui::Text("Irradiance  %6.0f W/m²", sunSample.irradianceWm2);
+            ImGui::Text("Above horizon: %s", sunSample.elevationDeg > 0.0f ? "yes" : "no");
+        }
+        ImGui::End();
+
+        ImGui::Render();
+
         // ---- Camera matrices from orbit state ----
         const glm::vec3 eye    = orbitEye(g_camera);
         const glm::vec3 center = g_camera.target;
@@ -463,6 +606,8 @@ int main() {
         cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
         cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
         cam.viewProj = cam.proj * cam.view;
+        cam.sunDirAndIrradiance = glm::vec4(sunSample.directionToSun,
+                                            sunSample.irradianceWm2);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
 
         vkCmdBeginRendering(frame.cmd, &renderingInfo);
@@ -487,6 +632,10 @@ int main() {
         vkCmdBindVertexBuffers(frame.cmd, 0, 1, &terrainVB.buffer, &vbOffset);
         vkCmdBindIndexBuffer  (frame.cmd, terrainIB.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed      (frame.cmd, static_cast<uint32_t>(mesh.indices.size()), 1, 0, 0, 0);
+
+        // ImGui draws into the same swapchain attachment; we let it run
+        // without depth so panels stay on top regardless of the terrain.
+        ImGui_ImplVulkan_RenderDrawData(ImGui::GetDrawData(), frame.cmd);
 
         vkCmdEndRendering(frame.cmd);
 
@@ -534,6 +683,11 @@ int main() {
 
     // Make sure the GPU is idle before tearing down resources still in use.
     VK_CHECK(vkDeviceWaitIdle(gpu.device));
+
+    ImGui_ImplVulkan_Shutdown();
+    ImGui_ImplGlfw_Shutdown();
+    ImGui::DestroyContext();
+    vkDestroyDescriptorPool(gpu.device, imguiDescPool, nullptr);
 
     vkDestroyPipeline(gpu.device, terrainPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, pipelineLayout, nullptr);

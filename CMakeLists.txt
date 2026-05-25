@@ -105,12 +105,15 @@ add_executable(alpine_sun
     src/dem_loader.cpp
     src/geo_frame.cpp
     src/terrain_mesh.cpp
+    src/psa.cpp
+    src/sun_driver.cpp
 )
 
 target_link_libraries(alpine_sun PRIVATE
     forfun::core   # alias for forfun_core
     glfw           # exposed by the forfun-graphics subdir via CPM
     tiff           # libtiff static lib target
+    imgui          # static lib defined in forfun-graphics' CMakeLists
 )
 
 target_include_directories(alpine_sun PRIVATE

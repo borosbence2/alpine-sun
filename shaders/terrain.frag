@@ -1,5 +1,12 @@
 #version 450
 
+layout(set = 0, binding = 0) uniform Camera {
+    mat4 view;
+    mat4 proj;
+    mat4 viewProj;
+    vec4 sunDirAndIrradiance;  // xyz = TO sun (ENU), w = direct beam W/m²
+} cam;
+
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in float vHeight;
 
@@ -25,11 +32,17 @@ void main() {
     // Steep faces lean rock-ward regardless of altitude.
     albedo      = mix(albedo, rock, slope * 0.6);
 
-    // Placeholder lighting: fixed sun direction (SPA-driven sun arrives in
-    // Phase 2). Lambert + 25% ambient floor.
-    vec3 sunDir = normalize(vec3(0.4, 0.3, 1.0));
-    float ndotl = max(0.0, dot(N, sunDir));
-    vec3 lit = albedo * (0.25 + 0.75 * ndotl);
+    vec3  sunDir = cam.sunDirAndIrradiance.xyz;
+    float ndotl  = max(0.0, dot(N, sunDir));
 
-    outColor = vec4(lit, 1.0);
+    // Sun below horizon → no direct contribution; smooth fade across the last
+    // few degrees so dawn/dusk feel gradual instead of cliff-edged.
+    float aboveHorizon = smoothstep(-0.05, 0.10, sunDir.z);
+    float direct = ndotl * aboveHorizon;
+
+    // Ambient also dims at night so dark side reads as actually dark, not
+    // mid-grey. 0.20 → 0.05 floor at full night.
+    float ambient = mix(0.05, 0.20, aboveHorizon);
+
+    outColor = vec4(albedo * (ambient + 0.75 * direct), 1.0);
 }

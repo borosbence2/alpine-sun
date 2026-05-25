@@ -8,6 +8,10 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 view;
     mat4 proj;
     mat4 viewProj;
+    // xyz = unit direction TO sun in ENU; .w = clear-sky direct beam (W/m²),
+    // 0 when below horizon. Fragment shader is the only consumer; vert keeps
+    // the binding declaration matched.
+    vec4 sunDirAndIrradiance;
 } cam;
 
 layout(location = 0) out vec3 vNormal;

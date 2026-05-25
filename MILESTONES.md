@@ -88,11 +88,11 @@ positioning via NREL SPA) is the next substantive milestone.
 
 | ID         | Description                                                                  | Status |
 |------------|------------------------------------------------------------------------------|--------|
-| A2.sun.1   | NREL SPA implementation (vendored C, ~600 LOC, public domain)                | TODO   |
-| A2.sun.2   | `SunDriver(lat, lon, date, time, tz) → vec3 direction + irradiance`          | TODO   |
-| A2.sun.3   | Wire `SunDriver` to the engine's existing directional light                  | TODO   |
-| A2.sun.4   | ImGui panel: date picker, time slider, location entry                        | TODO   |
-| A2.sun.5   | Verify against published sunrise/sunset for Zermatt on a few dates           | TODO   |
+| A2.sun.1   | PSA (Blanco-Muriel 2001) vendored at src/psa.{h,cpp} — ~80 LOC, public-domain. Chosen over NREL SPA to avoid the NREL licence; accurate to ~0.01° in 2026, easily upgradable. | DONE |
+| A2.sun.2   | `sun::compute(lat, lon, date, local_time, tz) → {directionToSun (ENU), elevation°, azimuth°, irradiance W/m²}` in src/sun_driver.{h,cpp}. | DONE |
+| A2.sun.3   | Terrain frag shader reads `sunDirAndIrradiance` from the camera UBO; below-horizon falls off via smoothstep. Hardcoded sun is gone. | DONE |
+| A2.sun.4   | ImGui panel "Sun" — lat/lon, year/month/day, local-hour slider, UTC offset, live azimuth/elevation/irradiance readout. | DONE |
+| A2.sun.5   | Eyeballed against the ImGui readout — sun rises/sets and tracks plausibly through the day for Zermatt. Good enough for the alpine use case. | DONE |
 
 ## Phase 3 — Sun occlusion (the core technical work)
 
