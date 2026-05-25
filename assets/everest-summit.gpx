@@ -1,25 +1,943 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<gpx version="1.1" creator="alpine-sun sample"
-     xmlns="http://www.topografix.com/GPX/1/1">
-  <trk>
-    <name>Everest South-Col route — Camp 2 to Summit</name>
-    <desc>Approximate line: Camp 2 in the Western Cwm → up the Lhotse face
-      → South Col (Camp 4) → Balcony → SE ridge → South Summit → Everest
-      summit. Coordinates traced from public knowledge of the major landmarks
-      (Camp 2 at the east end of the Western Cwm near 86.88°E; South Col at
-      27.973°N, 86.929°E; summit at 27.988°N, 86.925°E). ~100–200 m
-      accuracy — visualisation only, not navigation.</desc>
-    <trkseg>
-      <trkpt lat="27.9970" lon="86.8950"><ele>6400</ele></trkpt>  <!-- Camp 2 (Western Cwm, east end) -->
-      <trkpt lat="27.9905" lon="86.9100"><ele>6750</ele></trkpt>  <!-- Bergschrund / Lhotse face base -->
-      <trkpt lat="27.9840" lon="86.9180"><ele>7100</ele></trkpt>  <!-- Lower Lhotse face -->
-      <trkpt lat="27.9800" lon="86.9230"><ele>7450</ele></trkpt>  <!-- Mid Lhotse face -->
-      <trkpt lat="27.9760" lon="86.9260"><ele>7700</ele></trkpt>  <!-- Yellow Band / Geneva Spur -->
-      <trkpt lat="27.9735" lon="86.9290"><ele>7906</ele></trkpt>  <!-- South Col / Camp 4 -->
-      <trkpt lat="27.9800" lon="86.9270"><ele>8350</ele></trkpt>  <!-- Balcony -->
-      <trkpt lat="27.9840" lon="86.9258"><ele>8500</ele></trkpt>  <!-- SE ridge -->
-      <trkpt lat="27.9870" lon="86.9252"><ele>8748</ele></trkpt>  <!-- South Summit -->
-      <trkpt lat="27.9881" lon="86.9250"><ele>8849</ele></trkpt>  <!-- Everest Summit -->
-    </trkseg>
-  </trk>
+<gpx creator="StravaGPX" version="1.1" xmlns="http://www.topografix.com/GPX/1/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">
+ <metadata>
+  <name>Everest South Col Route (Everest Normal Route)</name>
+  <desc>The original route up Everest established by Edmond Hillary and Tenzing Norgay in 1953
+
+Mt. Everest was first summited by Sherpa Tenzing Norgay and New Zealander Edmond Hillary with a British expedition in 1953. They used the South Col route. At that time the route had only been attempted twice by Swiss teams in the spring and autumn of 1952. They reached 8500m well above the South Col. Of note, Norgay was with the Swiss thus giving him the experience he used on the British expedition. The Swiss returned in 1956 to make the second summit of Everest.Here is a typical south side climb schedule showing average time and the distance from the previous camp plus a brief description of each section. More details can be found on the South Col route page.Home away from home. Located on a moving glacier, tents can shift and platforms melt. The area is harsh but beautiful surrounded by Pumori and the Khumbu Icefall with warm mornings and afternoon snow squalls. With so many expedition tents, pathways and generators, it feels like a small village.C1: 19,500′/5943m – 4-6 hours, 1.62 milesReaching C1, is the most dangerous part of a south climb since it crosses the Khumbu Icefall. The Icefall is 2,000′ of moving ice, sometimes as much as 3 feet a day. But it is the deep crevasses, towering ice seracs and avalanches off Everest’s West shoulder that creates the most danger.C2: 21,000′/6400m – 2-3 hours, 1.74 milesThe trek from C1 to C2 crosses the Western CWM and can be laden with crevasse danger. But it is the extremely hot temperatures that takes a toll on climbers. Again avalanche danger exist from Everest’s West Shoulder that has dusted C1 in recent years.C3: 23,500′/7162m – 3-6 hours, 1.64 milesClimbing the Lhotse Face to C3 is often difficult since almost all climbers are feeling the effects of high altitude and are not yet using supplemental oxygen. The Lhotse Face is steep and the ice is hard. The route is fixed with rope. The angles can range from 20 to 45 degrees. It is a long climb to C3 but is required for acclimatization prior to a summit bid.Yellow Band – 3 hoursThe route to the South Col begins at C3 and across the Yellow Band. It starts steep but settles into a sustained grade as the altitude increases. Climbers are usually in their down suits and are using supplemental oxygen for the first time. The Yellow Band’s limestone rock itself is not difficult climbing but can be challenging given the altitude. Bottlenecks can occur on the Yellow Band.Geneva Spur – 2 hoursThis section can be a surprise for some climbers. The top of the Spur leading onto the South Col has some of the steepest climbing thus far. It is easier with a good layer of snow than on the loose rocks.South Col: 26,300′/8016m – 1 hour or lessWelcome to the moon. This is a flat area covered with loose rock and surrounded by Everest to the north and Lhotse on the south. Generally, teams cluster tents together and anchor with nets or heavy rocks against the hurricane force winds. This is the staging area for the summit bids and the high point for Sherpas to ferry oxygen and gear for the summit bid.Balcony: 27,500′/8400m- 4 – 5 hoursOfficially now on Everest, climbers are using supplemental oxygen to climb the steep and sustained route up the Triangular Face. The route is fixed with rope and climbers create a long conga line of headlamps in the dark. The pace is maddeningly slow complete with periods of full stop while climbers ahead rest, consider the decision to turn back or continue to the balcony. It can be rock or snow depending on the year. Rock fall can be an deadly issue and some climbers now use helmets. They swap oxygen bottles at the Balcony while taking a short break for some food and water.South Summit : 28500′/8690m – 3 to 5 hoursThe climb from the Balcony to the South Summit is steep and continuous. While mostly on a beaten down boot path, it can be challenging near the South Summit with exposed slabs of smooth rock in low snow years. The views of Lhotse and the sun rising to the east is indescribable at this point.Hillary Step – 1 hour or lessOne of the most exposed section of a south side climb is crossing the cornice traverse between the south summit and the Hillary Step. But the route is fixed and wide enough that climbers rarely have issues. The Hillary Step is a short 40′ section of rock climbing, again fixed with rope, that creates a bottleneck on crowded summit nights. Usually there is an up and down climbing rope to keep people moving.Summit: 29,035′/8850m – 1 hour or lessThe last section from the Hillary Step to the summit is a moderate snow slope. While tired, climber’s adrenaline keep them going.Return to South Col: 4 -7 hoursCare must be taken to avoid a misplaced step down climbing the Hillary Step, the Cornice Traverse or the slabs below the south summit. Also diligent monitoring of oxygen levels and supply is critical to make sure the oxygen lasts back to the South Col.Return to C2: 3 hoursUsually climbers are quite tired but happy to be returning to the higher natural oxygen levels regardless of their summit performance. It can be very hot since most climbers are still in their down suits.Return to base camp: 4 hours Packs are heavy since everything they hauled up over the preceding month must be taken back down. It is now almost June so the temperatures are warmer making the snow mushy thus increasing the difficulty. But each step brings them closer to base camp comforts and on to their home and families. Written by Kenton Cool</desc>
+  <author>
+   <name>Strava Routes</name>
+   <link href="https://www.strava.com/athletes/3370924"/>
+  </author>
+  <copyright author="OpenStreetMap contributors">
+   <year>2020</year>
+   <license>https://www.openstreetmap.org/copyright</license>
+  </copyright>
+  <link href="https://www.strava.com/routes/3247898443627269776"/>
+ </metadata>
+ <trk>
+  <name>Everest South Col Route (Everest Normal Route)</name>
+  <desc>The original route up Everest established by Edmond Hillary and Tenzing Norgay in 1953
+
+Mt. Everest was first summited by Sherpa Tenzing Norgay and New Zealander Edmond Hillary with a British expedition in 1953. They used the South Col route. At that time the route had only been attempted twice by Swiss teams in the spring and autumn of 1952. They reached 8500m well above the South Col. Of note, Norgay was with the Swiss thus giving him the experience he used on the British expedition. The Swiss returned in 1956 to make the second summit of Everest.Here is a typical south side climb schedule showing average time and the distance from the previous camp plus a brief description of each section. More details can be found on the South Col route page.Home away from home. Located on a moving glacier, tents can shift and platforms melt. The area is harsh but beautiful surrounded by Pumori and the Khumbu Icefall with warm mornings and afternoon snow squalls. With so many expedition tents, pathways and generators, it feels like a small village.C1: 19,500′/5943m – 4-6 hours, 1.62 milesReaching C1, is the most dangerous part of a south climb since it crosses the Khumbu Icefall. The Icefall is 2,000′ of moving ice, sometimes as much as 3 feet a day. But it is the deep crevasses, towering ice seracs and avalanches off Everest’s West shoulder that creates the most danger.C2: 21,000′/6400m – 2-3 hours, 1.74 milesThe trek from C1 to C2 crosses the Western CWM and can be laden with crevasse danger. But it is the extremely hot temperatures that takes a toll on climbers. Again avalanche danger exist from Everest’s West Shoulder that has dusted C1 in recent years.C3: 23,500′/7162m – 3-6 hours, 1.64 milesClimbing the Lhotse Face to C3 is often difficult since almost all climbers are feeling the effects of high altitude and are not yet using supplemental oxygen. The Lhotse Face is steep and the ice is hard. The route is fixed with rope. The angles can range from 20 to 45 degrees. It is a long climb to C3 but is required for acclimatization prior to a summit bid.Yellow Band – 3 hoursThe route to the South Col begins at C3 and across the Yellow Band. It starts steep but settles into a sustained grade as the altitude increases. Climbers are usually in their down suits and are using supplemental oxygen for the first time. The Yellow Band’s limestone rock itself is not difficult climbing but can be challenging given the altitude. Bottlenecks can occur on the Yellow Band.Geneva Spur – 2 hoursThis section can be a surprise for some climbers. The top of the Spur leading onto the South Col has some of the steepest climbing thus far. It is easier with a good layer of snow than on the loose rocks.South Col: 26,300′/8016m – 1 hour or lessWelcome to the moon. This is a flat area covered with loose rock and surrounded by Everest to the north and Lhotse on the south. Generally, teams cluster tents together and anchor with nets or heavy rocks against the hurricane force winds. This is the staging area for the summit bids and the high point for Sherpas to ferry oxygen and gear for the summit bid.Balcony: 27,500′/8400m- 4 – 5 hoursOfficially now on Everest, climbers are using supplemental oxygen to climb the steep and sustained route up the Triangular Face. The route is fixed with rope and climbers create a long conga line of headlamps in the dark. The pace is maddeningly slow complete with periods of full stop while climbers ahead rest, consider the decision to turn back or continue to the balcony. It can be rock or snow depending on the year. Rock fall can be an deadly issue and some climbers now use helmets. They swap oxygen bottles at the Balcony while taking a short break for some food and water.South Summit : 28500′/8690m – 3 to 5 hoursThe climb from the Balcony to the South Summit is steep and continuous. While mostly on a beaten down boot path, it can be challenging near the South Summit with exposed slabs of smooth rock in low snow years. The views of Lhotse and the sun rising to the east is indescribable at this point.Hillary Step – 1 hour or lessOne of the most exposed section of a south side climb is crossing the cornice traverse between the south summit and the Hillary Step. But the route is fixed and wide enough that climbers rarely have issues. The Hillary Step is a short 40′ section of rock climbing, again fixed with rope, that creates a bottleneck on crowded summit nights. Usually there is an up and down climbing rope to keep people moving.Summit: 29,035′/8850m – 1 hour or lessThe last section from the Hillary Step to the summit is a moderate snow slope. While tired, climber’s adrenaline keep them going.Return to South Col: 4 -7 hoursCare must be taken to avoid a misplaced step down climbing the Hillary Step, the Cornice Traverse or the slabs below the south summit. Also diligent monitoring of oxygen levels and supply is critical to make sure the oxygen lasts back to the South Col.Return to C2: 3 hoursUsually climbers are quite tired but happy to be returning to the higher natural oxygen levels regardless of their summit performance. It can be very hot since most climbers are still in their down suits.Return to base camp: 4 hours Packs are heavy since everything they hauled up over the preceding month must be taken back down. It is now almost June so the temperatures are warmer making the snow mushy thus increasing the difficulty. But each step brings them closer to base camp comforts and on to their home and families. Written by Kenton Cool</desc>
+  <link href="https://www.strava.com/routes/3247898443627269776"/>
+  <type>RockClimbing</type>
+  <trkseg>
+   <trkpt lat="27.997970000000002" lon="86.84791000000001">
+    <ele>5268.31</ele>
+   </trkpt>
+   <trkpt lat="27.998300000000004" lon="86.84839000000001">
+    <ele>5269.710000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99848" lon="86.84863000000001">
+    <ele>5270.69</ele>
+   </trkpt>
+   <trkpt lat="27.99856" lon="86.84886">
+    <ele>5271.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.998900000000003" lon="86.84928000000001">
+    <ele>5273.85</ele>
+   </trkpt>
+   <trkpt lat="27.99893" lon="86.84945">
+    <ele>5274.200000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99913" lon="86.84959">
+    <ele>5274.55</ele>
+   </trkpt>
+   <trkpt lat="27.999430000000004" lon="86.84963">
+    <ele>5275.15</ele>
+   </trkpt>
+   <trkpt lat="27.999710000000004" lon="86.84982000000001">
+    <ele>5274.6900000000005</ele>
+   </trkpt>
+   <trkpt lat="28.00008" lon="86.85058000000001">
+    <ele>5275.620000000001</ele>
+   </trkpt>
+   <trkpt lat="28.000400000000003" lon="86.85114">
+    <ele>5278.83</ele>
+   </trkpt>
+   <trkpt lat="28.000460000000004" lon="86.85131000000001">
+    <ele>5279.58</ele>
+   </trkpt>
+   <trkpt lat="28.000400000000003" lon="86.85154000000001">
+    <ele>5280.63</ele>
+   </trkpt>
+   <trkpt lat="28.000690000000002" lon="86.85202000000001">
+    <ele>5284.32</ele>
+   </trkpt>
+   <trkpt lat="28.00083" lon="86.85216000000001">
+    <ele>5285.12</ele>
+   </trkpt>
+   <trkpt lat="28.000950000000003" lon="86.85231">
+    <ele>5286.01</ele>
+   </trkpt>
+   <trkpt lat="28.0012" lon="86.85241">
+    <ele>5288.54</ele>
+   </trkpt>
+   <trkpt lat="28.00127" lon="86.85262">
+    <ele>5290.34</ele>
+   </trkpt>
+   <trkpt lat="28.00129" lon="86.85302">
+    <ele>5292.74</ele>
+   </trkpt>
+   <trkpt lat="28.00176" lon="86.85351000000001">
+    <ele>5296.790000000001</ele>
+   </trkpt>
+   <trkpt lat="28.001920000000002" lon="86.85363000000001">
+    <ele>5298.16</ele>
+   </trkpt>
+   <trkpt lat="28.00193" lon="86.85403000000001">
+    <ele>5300.000000000001</ele>
+   </trkpt>
+   <trkpt lat="28.00214" lon="86.85427000000001">
+    <ele>5302.820000000001</ele>
+   </trkpt>
+   <trkpt lat="28.002380000000002" lon="86.85458000000001">
+    <ele>5305.64</ele>
+   </trkpt>
+   <trkpt lat="28.002450000000003" lon="86.85475000000001">
+    <ele>5306.58</ele>
+   </trkpt>
+   <trkpt lat="28.00269" lon="86.85515000000001">
+    <ele>5309.63</ele>
+   </trkpt>
+   <trkpt lat="28.002810000000004" lon="86.85524000000001">
+    <ele>5311.32</ele>
+   </trkpt>
+   <trkpt lat="28.003145001054342" lon="86.85577499836674">
+    <ele>5314.950000000001</ele>
+   </trkpt>
+   <trkpt lat="28.003480000000003" lon="86.85631000000001">
+    <ele>5320.370000000001</ele>
+   </trkpt>
+   <trkpt lat="28.00355" lon="86.85649000000001">
+    <ele>5322.0</ele>
+   </trkpt>
+   <trkpt lat="28.003870000000003" lon="86.85695000000001">
+    <ele>5322.170000000001</ele>
+   </trkpt>
+   <trkpt lat="28.003870000000003" lon="86.85732">
+    <ele>5322.56</ele>
+   </trkpt>
+   <trkpt lat="28.004230000000003" lon="86.85776000000001">
+    <ele>5322.13</ele>
+   </trkpt>
+   <trkpt lat="28.004220000000004" lon="86.85802000000001">
+    <ele>5322.0</ele>
+   </trkpt>
+   <trkpt lat="28.00374" lon="86.85804">
+    <ele>5328.700000000001</ele>
+   </trkpt>
+   <trkpt lat="28.003760000000003" lon="86.85905000000001">
+    <ele>5340.000000000001</ele>
+   </trkpt>
+   <trkpt lat="28.00373" lon="86.8593">
+    <ele>5339.35</ele>
+   </trkpt>
+   <trkpt lat="28.00362" lon="86.85943">
+    <ele>5339.0</ele>
+   </trkpt>
+   <trkpt lat="28.00334" lon="86.85944">
+    <ele>5340.540000000001</ele>
+   </trkpt>
+   <trkpt lat="28.00305" lon="86.85963000000001">
+    <ele>5343.380000000001</ele>
+   </trkpt>
+   <trkpt lat="28.00288" lon="86.85985000000001">
+    <ele>5340.71</ele>
+   </trkpt>
+   <trkpt lat="28.002720000000004" lon="86.85999000000001">
+    <ele>5339.08</ele>
+   </trkpt>
+   <trkpt lat="28.002550000000003" lon="86.86074">
+    <ele>5350.580000000001</ele>
+   </trkpt>
+   <trkpt lat="28.0024" lon="86.86104">
+    <ele>5344.250000000001</ele>
+   </trkpt>
+   <trkpt lat="28.002350000000003" lon="86.86129000000001">
+    <ele>5339.54</ele>
+   </trkpt>
+   <trkpt lat="28.002390000000002" lon="86.86161000000001">
+    <ele>5339.12</ele>
+   </trkpt>
+   <trkpt lat="28.002460000000003" lon="86.8619">
+    <ele>5342.89</ele>
+   </trkpt>
+   <trkpt lat="28.002435001239036" lon="86.86248500011196">
+    <ele>5354.28</ele>
+   </trkpt>
+   <trkpt lat="28.00241" lon="86.86307000000001">
+    <ele>5354.28</ele>
+   </trkpt>
+   <trkpt lat="28.002340000000004" lon="86.8635">
+    <ele>5371.040000000001</ele>
+   </trkpt>
+   <trkpt lat="28.002180000000003" lon="86.86375000000001">
+    <ele>5374.52</ele>
+   </trkpt>
+   <trkpt lat="28.001400000000004" lon="86.86361000000001">
+    <ele>5377.18</ele>
+   </trkpt>
+   <trkpt lat="28.001230000000003" lon="86.86405">
+    <ele>5386.85</ele>
+   </trkpt>
+   <trkpt lat="28.001240000000003" lon="86.86426">
+    <ele>5393.35</ele>
+   </trkpt>
+   <trkpt lat="28.001060000000003" lon="86.86447000000001">
+    <ele>5401.26</ele>
+   </trkpt>
+   <trkpt lat="28.000865001001106" lon="86.86499000087984">
+    <ele>5427.56</ele>
+   </trkpt>
+   <trkpt lat="28.000670000000003" lon="86.86551">
+    <ele>5450.07</ele>
+   </trkpt>
+   <trkpt lat="28.000510000000002" lon="86.86580000000001">
+    <ele>5465.51</ele>
+   </trkpt>
+   <trkpt lat="27.999760000000002" lon="86.86613000000001">
+    <ele>5516.170000000001</ele>
+   </trkpt>
+   <trkpt lat="27.999740000000003" lon="86.86653000000001">
+    <ele>5525.12</ele>
+   </trkpt>
+   <trkpt lat="27.999540000000003" lon="86.86673">
+    <ele>5530.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99923" lon="86.86689000000001">
+    <ele>5541.110000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99886" lon="86.86706000000001">
+    <ele>5557.22</ele>
+   </trkpt>
+   <trkpt lat="27.99866" lon="86.86717">
+    <ele>5564.800000000001</ele>
+   </trkpt>
+   <trkpt lat="27.998250000000002" lon="86.86758">
+    <ele>5579.490000000001</ele>
+   </trkpt>
+   <trkpt lat="27.997740000000004" lon="86.86784">
+    <ele>5592.92</ele>
+   </trkpt>
+   <trkpt lat="27.997660000000003" lon="86.86795000000001">
+    <ele>5597.26</ele>
+   </trkpt>
+   <trkpt lat="27.99762" lon="86.86817">
+    <ele>5607.3099999999995</ele>
+   </trkpt>
+   <trkpt lat="27.997660000000003" lon="86.86854000000001">
+    <ele>5621.12</ele>
+   </trkpt>
+   <trkpt lat="27.99763" lon="86.86864000000001">
+    <ele>5626.7300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.99744" lon="86.86884">
+    <ele>5643.420000000001</ele>
+   </trkpt>
+   <trkpt lat="27.997310000000002" lon="86.86895000000001">
+    <ele>5663.51</ele>
+   </trkpt>
+   <trkpt lat="27.99724" lon="86.86913000000001">
+    <ele>5668.43</ele>
+   </trkpt>
+   <trkpt lat="27.997270000000004" lon="86.86932">
+    <ele>5673.14</ele>
+   </trkpt>
+   <trkpt lat="27.997370000000004" lon="86.86965000000001">
+    <ele>5682.3</ele>
+   </trkpt>
+   <trkpt lat="27.997560000000004" lon="86.87012">
+    <ele>5686.04</ele>
+   </trkpt>
+   <trkpt lat="27.997930000000004" lon="86.87023">
+    <ele>5691.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.997860000000003" lon="86.87057">
+    <ele>5698.12</ele>
+   </trkpt>
+   <trkpt lat="27.997780000000002" lon="86.87123000000001">
+    <ele>5719.39</ele>
+   </trkpt>
+   <trkpt lat="27.997760000000003" lon="86.87168000000001">
+    <ele>5731.7300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.997410000000002" lon="86.87201">
+    <ele>5742.7300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.997110000932743" lon="86.87252500147929">
+    <ele>5758.320000000001</ele>
+   </trkpt>
+   <trkpt lat="27.996810000000004" lon="86.87304">
+    <ele>5770.7300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.99642" lon="86.87347000000001">
+    <ele>5796.910000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99631" lon="86.87367">
+    <ele>5790.01</ele>
+   </trkpt>
+   <trkpt lat="27.99575" lon="86.87333000000001">
+    <ele>5790.89</ele>
+   </trkpt>
+   <trkpt lat="27.995260000000002" lon="86.87355000000001">
+    <ele>5814.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.995140000000003" lon="86.87371">
+    <ele>5825.34</ele>
+   </trkpt>
+   <trkpt lat="27.994840000000003" lon="86.87443">
+    <ele>5853.370000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99471" lon="86.87534000000001">
+    <ele>5885.64</ele>
+   </trkpt>
+   <trkpt lat="27.99461" lon="86.87573">
+    <ele>5900.220000000001</ele>
+   </trkpt>
+   <trkpt lat="27.994400000000002" lon="86.87634000000001">
+    <ele>5915.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.994170000000004" lon="86.87631">
+    <ele>5920.39</ele>
+   </trkpt>
+   <trkpt lat="27.993910000000003" lon="86.87638000000001">
+    <ele>5930.17</ele>
+   </trkpt>
+   <trkpt lat="27.993700000000004" lon="86.8763">
+    <ele>5942.88</ele>
+   </trkpt>
+   <trkpt lat="27.993550000000003" lon="86.87631">
+    <ele>5949.210000000001</ele>
+   </trkpt>
+   <trkpt lat="27.993290000000002" lon="86.8759">
+    <ele>5948.1</ele>
+   </trkpt>
+   <trkpt lat="27.993160000000003" lon="86.87573">
+    <ele>5947.42</ele>
+   </trkpt>
+   <trkpt lat="27.99301" lon="86.87566000000001">
+    <ele>5950.87</ele>
+   </trkpt>
+   <trkpt lat="27.992770000000004" lon="86.87579000000001">
+    <ele>5958.21</ele>
+   </trkpt>
+   <trkpt lat="27.99266" lon="86.87587">
+    <ele>5961.96</ele>
+   </trkpt>
+   <trkpt lat="27.99257" lon="86.87607000000001">
+    <ele>5970.64</ele>
+   </trkpt>
+   <trkpt lat="27.992310000000003" lon="86.87681">
+    <ele>5985.080000000001</ele>
+   </trkpt>
+   <trkpt lat="27.992140000000003" lon="86.87700000000001">
+    <ele>5985.080000000001</ele>
+   </trkpt>
+   <trkpt lat="27.9918" lon="86.87735">
+    <ele>6005.13</ele>
+   </trkpt>
+   <trkpt lat="27.99161" lon="86.87751">
+    <ele>6009.4400000000005</ele>
+   </trkpt>
+   <trkpt lat="27.991310000000002" lon="86.87774">
+    <ele>6013.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.991090000000003" lon="86.87782000000001">
+    <ele>6014.620000000001</ele>
+   </trkpt>
+   <trkpt lat="27.99078" lon="86.87777000000001">
+    <ele>6018.85</ele>
+   </trkpt>
+   <trkpt lat="27.9901" lon="86.87741000000001">
+    <ele>6031.860000000001</ele>
+   </trkpt>
+   <trkpt lat="27.989530000000002" lon="86.87735">
+    <ele>6037.56</ele>
+   </trkpt>
+   <trkpt lat="27.989240000000002" lon="86.87751">
+    <ele>6036.76</ele>
+   </trkpt>
+   <trkpt lat="27.988940000000003" lon="86.87750000000001">
+    <ele>6037.89</ele>
+   </trkpt>
+   <trkpt lat="27.988670000000003" lon="86.87740000000001">
+    <ele>6043.16</ele>
+   </trkpt>
+   <trkpt lat="27.988460000000003" lon="86.87716">
+    <ele>6042.2</ele>
+   </trkpt>
+   <trkpt lat="27.98813" lon="86.87698">
+    <ele>6039.610000000001</ele>
+   </trkpt>
+   <trkpt lat="27.987600000000004" lon="86.87691000000001">
+    <ele>6043.75</ele>
+   </trkpt>
+   <trkpt lat="27.987130000000004" lon="86.87709000000001">
+    <ele>6045.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.986880000000003" lon="86.87724">
+    <ele>6045.25</ele>
+   </trkpt>
+   <trkpt lat="27.986500000000003" lon="86.87767000000001">
+    <ele>6050.160000000001</ele>
+   </trkpt>
+   <trkpt lat="27.986300000000004" lon="86.87781000000001">
+    <ele>6052.250000000001</ele>
+   </trkpt>
+   <trkpt lat="27.985970000000002" lon="86.87774">
+    <ele>6054.06</ele>
+   </trkpt>
+   <trkpt lat="27.985770000000002" lon="86.87763000000001">
+    <ele>6053.16</ele>
+   </trkpt>
+   <trkpt lat="27.98552" lon="86.8777">
+    <ele>6061.570000000001</ele>
+   </trkpt>
+   <trkpt lat="27.985065001080386" lon="86.87822500211881">
+    <ele>6079.5</ele>
+   </trkpt>
+   <trkpt lat="27.984610000000004" lon="86.87875000000001">
+    <ele>6081.7300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.98422" lon="86.87908">
+    <ele>6116.97</ele>
+   </trkpt>
+   <trkpt lat="27.984160000000003" lon="86.87933000000001">
+    <ele>6124.320000000001</ele>
+   </trkpt>
+   <trkpt lat="27.984230000000004" lon="86.87970000000001">
+    <ele>6126.77</ele>
+   </trkpt>
+   <trkpt lat="27.984240000000003" lon="86.87996000000001">
+    <ele>6131.2300000000005</ele>
+   </trkpt>
+   <trkpt lat="27.984140000000004" lon="86.88007">
+    <ele>6133.080000000001</ele>
+   </trkpt>
+   <trkpt lat="27.983850000000004" lon="86.88023000000001">
+    <ele>6140.900000000001</ele>
+   </trkpt>
+   <trkpt lat="27.983620000000002" lon="86.88008">
+    <ele>6142.14</ele>
+   </trkpt>
+   <trkpt lat="27.983470000000004" lon="86.88002">
+    <ele>6143.77</ele>
+   </trkpt>
+   <trkpt lat="27.983330000000002" lon="86.88009000000001">
+    <ele>6145.580000000001</ele>
+   </trkpt>
+   <trkpt lat="27.983210000000003" lon="86.88023000000001">
+    <ele>6148.83</ele>
+   </trkpt>
+   <trkpt lat="27.98318" lon="86.88041000000001">
+    <ele>6152.47</ele>
+   </trkpt>
+   <trkpt lat="27.983230000000002" lon="86.88068000000001">
+    <ele>6158.410000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98336" lon="86.88102">
+    <ele>6164.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98337" lon="86.88116000000001">
+    <ele>6166.250000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98325" lon="86.88129">
+    <ele>6167.55</ele>
+   </trkpt>
+   <trkpt lat="27.98307" lon="86.88125000000001">
+    <ele>6166.89</ele>
+   </trkpt>
+   <trkpt lat="27.982950000000002" lon="86.88115">
+    <ele>6165.93</ele>
+   </trkpt>
+   <trkpt lat="27.982260000000004" lon="86.88139000000001">
+    <ele>6175.22</ele>
+   </trkpt>
+   <trkpt lat="27.982360000000003" lon="86.88178">
+    <ele>6173.72</ele>
+   </trkpt>
+   <trkpt lat="27.982520000964257" lon="86.88229499925276">
+    <ele>6177.72</ele>
+   </trkpt>
+   <trkpt lat="27.982680000000002" lon="86.88281">
+    <ele>6182.17</ele>
+   </trkpt>
+   <trkpt lat="27.98261333743719" lon="86.88356333426758">
+    <ele>6187.0</ele>
+   </trkpt>
+   <trkpt lat="27.982546670770272" lon="86.88431666760374">
+    <ele>6193.81</ele>
+   </trkpt>
+   <trkpt lat="27.982480000000002" lon="86.88507000000001">
+    <ele>6203.110000000001</ele>
+   </trkpt>
+   <trkpt lat="27.982380000000003" lon="86.88562">
+    <ele>6209.45</ele>
+   </trkpt>
+   <trkpt lat="27.982390000000002" lon="86.88607">
+    <ele>6215.18</ele>
+   </trkpt>
+   <trkpt lat="27.982270000000003" lon="86.88688">
+    <ele>6226.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.982210000000002" lon="86.88755">
+    <ele>6235.910000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98222" lon="86.88845">
+    <ele>6252.090000000001</ele>
+   </trkpt>
+   <trkpt lat="27.982143338159595" lon="86.88926666779446">
+    <ele>6265.960000000001</ele>
+   </trkpt>
+   <trkpt lat="27.982066671496057" lon="86.89008333442777">
+    <ele>6277.94</ele>
+   </trkpt>
+   <trkpt lat="27.981990000000003" lon="86.8909">
+    <ele>6284.97</ele>
+   </trkpt>
+   <trkpt lat="27.981915001155574" lon="86.89147000054244">
+    <ele>6295.88</ele>
+   </trkpt>
+   <trkpt lat="27.981840000000002" lon="86.89204000000001">
+    <ele>6302.950000000001</ele>
+   </trkpt>
+   <trkpt lat="27.9817900033687" lon="86.89300500041713">
+    <ele>6319.750000000001</ele>
+   </trkpt>
+   <trkpt lat="27.981740000000002" lon="86.89397000000001">
+    <ele>6332.1</ele>
+   </trkpt>
+   <trkpt lat="27.981800000000003" lon="86.89438000000001">
+    <ele>6338.42</ele>
+   </trkpt>
+   <trkpt lat="27.98178" lon="86.89488">
+    <ele>6343.51</ele>
+   </trkpt>
+   <trkpt lat="27.981880000000004" lon="86.8952">
+    <ele>6346.0</ele>
+   </trkpt>
+   <trkpt lat="27.981880000000004" lon="86.89546000000001">
+    <ele>6349.73</ele>
+   </trkpt>
+   <trkpt lat="27.981810000000003" lon="86.89567000000001">
+    <ele>6351.1900000000005</ele>
+   </trkpt>
+   <trkpt lat="27.981810000000003" lon="86.89579">
+    <ele>6352.250000000001</ele>
+   </trkpt>
+   <trkpt lat="27.981700000000004" lon="86.89638000000001">
+    <ele>6359.360000000001</ele>
+   </trkpt>
+   <trkpt lat="27.981550000000002" lon="86.89683000000001">
+    <ele>6366.0</ele>
+   </trkpt>
+   <trkpt lat="27.981500000000004" lon="86.89712">
+    <ele>6371.21</ele>
+   </trkpt>
+   <trkpt lat="27.981510000000004" lon="86.89741000000001">
+    <ele>6373.94</ele>
+   </trkpt>
+   <trkpt lat="27.981610000000003" lon="86.89774000000001">
+    <ele>6378.500000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98168" lon="86.89825">
+    <ele>6385.67</ele>
+   </trkpt>
+   <trkpt lat="27.981550000000002" lon="86.89874">
+    <ele>6393.040000000001</ele>
+   </trkpt>
+   <trkpt lat="27.981410000000004" lon="86.89896">
+    <ele>6396.05</ele>
+   </trkpt>
+   <trkpt lat="27.981340000000003" lon="86.89922000000001">
+    <ele>6401.89</ele>
+   </trkpt>
+   <trkpt lat="27.981220000000004" lon="86.89947000000001">
+    <ele>6407.55</ele>
+   </trkpt>
+   <trkpt lat="27.981050000000003" lon="86.89994">
+    <ele>6416.64</ele>
+   </trkpt>
+   <trkpt lat="27.980850000000004" lon="86.90024000000001">
+    <ele>6427.9</ele>
+   </trkpt>
+   <trkpt lat="27.98035" lon="86.90108000000001">
+    <ele>6451.130000000001</ele>
+   </trkpt>
+   <trkpt lat="27.980150000000002" lon="86.90148">
+    <ele>6461.27</ele>
+   </trkpt>
+   <trkpt lat="27.980000000000004" lon="86.90197">
+    <ele>6471.22</ele>
+   </trkpt>
+   <trkpt lat="27.979860000000002" lon="86.90208000000001">
+    <ele>6474.06</ele>
+   </trkpt>
+   <trkpt lat="27.97979" lon="86.90254">
+    <ele>6481.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97993000088205" lon="86.90302999941271">
+    <ele>6485.38</ele>
+   </trkpt>
+   <trkpt lat="27.98007" lon="86.90352">
+    <ele>6490.34</ele>
+   </trkpt>
+   <trkpt lat="27.979870000000002" lon="86.90412">
+    <ele>6493.640000000001</ele>
+   </trkpt>
+   <trkpt lat="27.979680000000002" lon="86.90443">
+    <ele>6497.150000000001</ele>
+   </trkpt>
+   <trkpt lat="27.979640000000003" lon="86.90479">
+    <ele>6500.18</ele>
+   </trkpt>
+   <trkpt lat="27.979580000000002" lon="86.90499000000001">
+    <ele>6500.81</ele>
+   </trkpt>
+   <trkpt lat="27.979580000000002" lon="86.905">
+    <ele>6500.81</ele>
+   </trkpt>
+   <trkpt lat="27.979460000000003" lon="86.90505">
+    <ele>6500.950000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97923" lon="86.90491">
+    <ele>6501.6900000000005</ele>
+   </trkpt>
+   <trkpt lat="27.97894" lon="86.90499000000001">
+    <ele>6501.0</ele>
+   </trkpt>
+   <trkpt lat="27.97887" lon="86.90525000000001">
+    <ele>6502.870000000001</ele>
+   </trkpt>
+   <trkpt lat="27.978730000000002" lon="86.90553000000001">
+    <ele>6505.870000000001</ele>
+   </trkpt>
+   <trkpt lat="27.978630000000003" lon="86.90579000000001">
+    <ele>6508.09</ele>
+   </trkpt>
+   <trkpt lat="27.97848" lon="86.9063">
+    <ele>6512.85</ele>
+   </trkpt>
+   <trkpt lat="27.97838" lon="86.90651000000001">
+    <ele>6514.320000000001</ele>
+   </trkpt>
+   <trkpt lat="27.978230000000003" lon="86.90667">
+    <ele>6515.35</ele>
+   </trkpt>
+   <trkpt lat="27.978170000000002" lon="86.90676">
+    <ele>6515.95</ele>
+   </trkpt>
+   <trkpt lat="27.978080000000002" lon="86.90702">
+    <ele>6517.93</ele>
+   </trkpt>
+   <trkpt lat="27.977980000000002" lon="86.9072">
+    <ele>6519.16</ele>
+   </trkpt>
+   <trkpt lat="27.977800000000002" lon="86.90746">
+    <ele>6523.360000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97737" lon="86.90787">
+    <ele>6535.4</ele>
+   </trkpt>
+   <trkpt lat="27.976830000000003" lon="86.90829000000001">
+    <ele>6553.900000000001</ele>
+   </trkpt>
+   <trkpt lat="27.9765" lon="86.90851">
+    <ele>6559.96</ele>
+   </trkpt>
+   <trkpt lat="27.9764" lon="86.90848000000001">
+    <ele>6571.570000000001</ele>
+   </trkpt>
+   <trkpt lat="27.976260000000003" lon="86.90883000000001">
+    <ele>6576.950000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97575" lon="86.90910000000001">
+    <ele>6575.96</ele>
+   </trkpt>
+   <trkpt lat="27.9753" lon="86.90949">
+    <ele>6583.49</ele>
+   </trkpt>
+   <trkpt lat="27.974860000000003" lon="86.91028">
+    <ele>6603.540000000001</ele>
+   </trkpt>
+   <trkpt lat="27.974420000000002" lon="86.91094000000001">
+    <ele>6628.500000000001</ele>
+   </trkpt>
+   <trkpt lat="27.973910000000004" lon="86.91157000000001">
+    <ele>6632.89</ele>
+   </trkpt>
+   <trkpt lat="27.97352" lon="86.91185">
+    <ele>6634.860000000001</ele>
+   </trkpt>
+   <trkpt lat="27.972900000000003" lon="86.91168">
+    <ele>6690.39</ele>
+   </trkpt>
+   <trkpt lat="27.972450000000002" lon="86.91218">
+    <ele>6709.56</ele>
+   </trkpt>
+   <trkpt lat="27.972310000000004" lon="86.91246000000001">
+    <ele>6720.08</ele>
+   </trkpt>
+   <trkpt lat="27.972220000000004" lon="86.91285">
+    <ele>6737.6900000000005</ele>
+   </trkpt>
+   <trkpt lat="27.972050000000003" lon="86.91324">
+    <ele>6761.01</ele>
+   </trkpt>
+   <trkpt lat="27.971595001227527" lon="86.9138600028356">
+    <ele>6794.790000000001</ele>
+   </trkpt>
+   <trkpt lat="27.971140000000002" lon="86.91448000000001">
+    <ele>6827.660000000001</ele>
+   </trkpt>
+   <trkpt lat="27.971090000000004" lon="86.91457000000001">
+    <ele>6829.77</ele>
+   </trkpt>
+   <trkpt lat="27.971010000000003" lon="86.91526">
+    <ele>6871.400000000001</ele>
+   </trkpt>
+   <trkpt lat="27.9706" lon="86.91607">
+    <ele>6937.22</ele>
+   </trkpt>
+   <trkpt lat="27.9705" lon="86.91622000000001">
+    <ele>6942.85</ele>
+   </trkpt>
+   <trkpt lat="27.970440000000004" lon="86.91626000000001">
+    <ele>6945.04</ele>
+   </trkpt>
+   <trkpt lat="27.97033" lon="86.91629">
+    <ele>6948.99</ele>
+   </trkpt>
+   <trkpt lat="27.970170000000003" lon="86.91646">
+    <ele>6964.460000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97003" lon="86.91647">
+    <ele>6971.27</ele>
+   </trkpt>
+   <trkpt lat="27.969900000000003" lon="86.91659000000001">
+    <ele>6985.75</ele>
+   </trkpt>
+   <trkpt lat="27.969720000000002" lon="86.91697">
+    <ele>7009.220000000001</ele>
+   </trkpt>
+   <trkpt lat="27.96955" lon="86.91748000000001">
+    <ele>7023.780000000001</ele>
+   </trkpt>
+   <trkpt lat="27.969275000870162" lon="86.91798000133534">
+    <ele>7063.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.969" lon="86.91848">
+    <ele>7063.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.968725001264705" lon="86.91908000160902">
+    <ele>7063.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.96845" lon="86.91968000000001">
+    <ele>7063.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.96815667180669" lon="86.92052333792293">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.967863338471798" lon="86.92136667126064">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.967570000000002" lon="86.92221">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.96711" lon="86.92280000000001">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.967190000000002" lon="86.92362000000001">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.967525001853442" lon="86.92433499779213">
+    <ele>7423.530000000001</ele>
+   </trkpt>
+   <trkpt lat="27.96786" lon="86.92505000000001">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.967960001452877" lon="86.92568499938213">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.96806" lon="86.92632">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.96817" lon="86.92639000000001">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.96853" lon="86.92721">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.96886500059294" lon="86.92759999883938">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.9692" lon="86.92799000000001">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.969710000000003" lon="86.92802">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.96994" lon="86.92796000000001">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.97059" lon="86.92761">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.971290000000003" lon="86.92772000000001">
+    <ele>7680.0</ele>
+   </trkpt>
+   <trkpt lat="27.971760000000003" lon="86.92813000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.972070000000002" lon="86.92854000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97286" lon="86.92893000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97305" lon="86.92909">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97322" lon="86.92945">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.973280000000003" lon="86.9298">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.973370000000003" lon="86.93006000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.973550000000003" lon="86.93023000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97378" lon="86.93032000000001">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.974050000000002" lon="86.93052">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97434" lon="86.93053">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.974890000000002" lon="86.9308">
+    <ele>7869.000000000001</ele>
+   </trkpt>
+   <trkpt lat="27.975640000000002" lon="86.93090000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97565" lon="86.93090000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.976290000000002" lon="86.93093">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97679" lon="86.93072000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.977140000000002" lon="86.93047000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.977310000000003" lon="86.93031">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.977520000000002" lon="86.93007">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.977700000000002" lon="86.93003">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.978130000000004" lon="86.92983000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97838" lon="86.92976">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.978420000000003" lon="86.92966000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.97884" lon="86.92956000000001">
+    <ele>7910.330000000001</ele>
+   </trkpt>
+   <trkpt lat="27.979450000000003" lon="86.92926000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.98016" lon="86.92899000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.980570000000004" lon="86.92889000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.981115000090746" lon="86.92890499992666">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.98166" lon="86.92892">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.981810000000003" lon="86.92901">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.982110000000002" lon="86.92905">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.982300000000002" lon="86.92914">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.98251" lon="86.92911000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.9827" lon="86.92893000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.982720000000004" lon="86.92888">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.9827" lon="86.92876000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.982915001210774" lon="86.92817500123896">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.983130000000003" lon="86.92759000000001">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.983556668580334" lon="86.92707667071939">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.983983335254997" lon="86.92656333737646">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.984410000000004" lon="86.92605">
+    <ele>8348.0</ele>
+   </trkpt>
+   <trkpt lat="27.98505000033762" lon="86.92576500167209">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98569" lon="86.92548000000001">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98645" lon="86.92556">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98683" lon="86.92537">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98702" lon="86.92536000000001">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.98712" lon="86.92528">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.9873" lon="86.92530000000001">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.987560000000002" lon="86.92522000000001">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+   <trkpt lat="27.987830000000002" lon="86.92519">
+    <ele>8708.630000000001</ele>
+   </trkpt>
+  </trkseg>
+ </trk>
 </gpx>

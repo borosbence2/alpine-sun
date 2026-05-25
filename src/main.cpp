@@ -187,6 +187,7 @@ struct OrbitCamera {
 
 struct InputState {
     bool   leftDown      = false;
+    bool   middleDown    = false;
     bool   rightDown     = false;
     double lastX         = 0.0;
     double lastY         = 0.0;
@@ -2005,7 +2006,8 @@ int main(int argc, char** argv) {
                     s.azimuthDeg, s.elevationDeg, s.irradianceWm2);
     }
 
-    std::printf("alpine-sun: window open. Left-drag to orbit, scroll to zoom, ESC to quit.\n");
+    std::printf("alpine-sun: window open. Left-drag = orbit, middle-drag = pan,\n"
+                "                          scroll = zoom, right-click = pick, ESC = quit.\n");
 
     // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
     // clear actually happened (vs. driver-default black).
@@ -2047,8 +2049,32 @@ int main(int argc, char** argv) {
                 g_camera.pitch = std::clamp(g_camera.pitch, -kPitchLimit, kPitchLimit);
             }
             g_input.leftDown = leftHeld;
-            g_input.lastX    = mx;
-            g_input.lastY    = my;
+
+            // Middle-mouse drag pans the orbit target in the plane
+            // perpendicular to the camera's forward axis. Scaled so a full
+            // viewport-height drag moves the target by ~one viewport height of
+            // world space at the current orbit distance.
+            const bool middleHeld = !uiCapturesMouse
+                && glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+            if (middleHeld && g_input.middleDown) {
+                const double dx = mx - g_input.lastX;
+                const double dy = my - g_input.lastY;
+                const glm::vec3 eye     = orbitEye(g_camera);
+                const glm::vec3 forward = glm::normalize(g_camera.target - eye);
+                const glm::vec3 worldUp = glm::vec3(0.0f, 0.0f, 1.0f);
+                const glm::vec3 right   = glm::normalize(glm::cross(forward, worldUp));
+                const glm::vec3 camUp   = glm::cross(right, forward);
+                const float fovY        = glm::radians(60.0f);
+                const float pxToWorld   = 2.0f * std::tan(fovY * 0.5f)
+                                        * g_camera.distance
+                                        / static_cast<float>(sc.extent.height);
+                g_camera.target -= right * static_cast<float>(dx) * pxToWorld;
+                g_camera.target += camUp * static_cast<float>(dy) * pxToWorld;
+            }
+            g_input.middleDown = middleHeld;
+
+            g_input.lastX = mx;
+            g_input.lastY = my;
 
             if (g_input.scrollPending != 0.0) {
                 // Each scroll tick scales distance by 0.9 (in) or 1/0.9 (out).
