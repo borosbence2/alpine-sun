@@ -98,11 +98,11 @@ positioning via NREL SPA) is the next substantive milestone.
 
 | ID         | Description                                                                  | Status |
 |------------|------------------------------------------------------------------------------|--------|
-| A3.occ.1   | Sun-POV shadow map (reuse existing shadow infra; large extent, ortho)        | TODO   |
-| A3.occ.2   | Horizon map data model — RG16F or R32 storage image, N azimuth bins          | TODO   |
-| A3.occ.3   | Horizon map compute shader (per-texel scan, configurable radius)             | TODO   |
-| A3.occ.4   | Terrain frag shader: O(1) horizon sample → `sunVisibility` factor            | TODO   |
-| A3.occ.5   | A/B toggle in ImGui: horizon-map vs shadow-map vs both                       | TODO   |
+| A3.occ.1   | Sun-POV ortho shadow map at 2048², depth-only pipeline driven by `terrain_depth.vert` (push-constant lightViewProj). Light frustum auto-fits to the terrain AABB rotated into light view. Terrain frag samples with 3×3 PCF. ImGui exposes enable + slope/constant bias. | DONE |
+| A3.occ.2   | Horizon-map storage image: `R16_SFLOAT`, 512² × 32 azimuth layers (2D array). Built from the full-resolution DEM, uploaded once as an `R32F` sampled texture. | DONE |
+| A3.occ.3   | `horizon_map.comp` raymarches each texel across the heightmap (128 steps × 150m = 19.2 km radius). One-shot dispatch at startup, terrain-only — independent of sun position so it serves all times of day. | DONE |
+| A3.occ.4   | Terrain frag samples `sampler2DArray uHorizonMap` (binding 2). World-XY → UV via `terrainAabb` UBO field; sun azimuth → bin float; linear interpolation between adjacent bins; smoothstep comparison vs sun elevation. | DONE |
+| A3.occ.5   | ImGui exposes "Shadow map" + "Horizon map" as independent toggles; `min(vShadow, vHorizon)` so either occluder darkens. | DONE |
 | A3.occ.6   | **Optional** `VK_KHR_ray_tracing_pipeline` + BVH for sharp near-terrain shadows | TODO |
 
 ## Phase 4 — Sun-hours visualisation

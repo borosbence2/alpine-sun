@@ -24,6 +24,8 @@
 
 #include "terrain.vert.h"
 #include "terrain.frag.h"
+#include "terrain_depth.vert.h"
+#include "horizon_map.comp.h"
 
 #include <algorithm>
 #include <array>
@@ -32,19 +34,24 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 
 namespace {
 
 // std140-ish camera block. All three matrices are written each frame; the
-// shader uses viewProj, but view+proj are kept for future passes (shadow,
-// horizon precompute) that may want them separately. sunDirAndIrradiance is
-// xyz = unit direction TO sun (ENU frame), w = direct-beam W/m² (0 at night).
-// vec4 not vec3+float so std140 packing matches the C++ layout naturally.
+// shader uses viewProj, but view+proj are kept for future passes (horizon
+// precompute) that may want them separately. lightViewProj projects world
+// positions into the shadow map's clip space. sunDirAndIrradiance is xyz =
+// unit direction TO sun (ENU frame), w = direct-beam W/m² (0 at night). vec4
+// not vec3+float so std140 packing matches the C++ layout naturally.
 struct alignas(16) CameraUBO {
     glm::mat4 view;
     glm::mat4 proj;
     glm::mat4 viewProj;
+    glm::mat4 lightViewProj;
     glm::vec4 sunDirAndIrradiance;
+    glm::vec4 occlusionParams;       // .x = shadow-map enabled, .y = horizon-map enabled
+    glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
 // Inputs to the SunDriver, owned by the UI. Defaults frame the Matterhorn
@@ -58,6 +65,29 @@ struct SunUi {
     float localHour =   12.0f;
     float tzOffsetH =    2.0f;
 };
+
+// Occlusion controls. Shadow map = sun-POV depth pass, sharp near-terrain
+// shadows but resolution-limited at this scale. Horizon map = per-texel
+// precomputed apparent-elevation profile, captures large-scale ridges at O(1)
+// per fragment; rebuilt only when the terrain changes (i.e. once at startup).
+//
+// Bias values forward straight to vkCmdSetDepthBias and only apply to the
+// shadow map. Resolution of the shadow map comes from kShadowMapSize in
+// forfun's types.h (currently 2048).
+struct ShadowUi {
+    bool  shadowMapEnabled  = true;
+    bool  horizonMapEnabled = true;
+    float depthBiasConstant = 1.25f;
+    float depthBiasSlope    = 2.50f;
+};
+
+// Horizon-map dimensions. Picked to balance memory + bake cost.
+//   512 × 512 × 32 × 2 bytes = 16 MB.
+constexpr uint32_t kHorizonMapSize = 512;
+constexpr uint32_t kHorizonBins    = 32;
+// Raymarch params (also used by the compute shader via push constants).
+constexpr float    kHorizonStepDistMeters = 150.0f;
+constexpr int      kHorizonMaxSteps       = 128;
 
 // Orbit camera: eye orbits around `target` on a sphere of radius `distance`.
 // yaw is the compass angle from +X (east) measured CCW around +Z; pitch is the
@@ -83,6 +113,7 @@ struct InputState {
 OrbitCamera g_camera;
 InputState  g_input;
 SunUi       g_sun;
+ShadowUi    g_shadow;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -101,14 +132,67 @@ glm::vec3 orbitEye(const OrbitCamera& c) {
     return c.target + c.distance * glm::vec3(cp * cy, cp * sy, sp);
 }
 
-terrain::Mesh loadAndBuildTerrain() {
-    dem::Tile tile;
+// Fit an orthographic frustum to the terrain AABB rotated into light view
+// space. The light "eye" looks down `-sunDir` toward the AABB centre; near/far
+// span the projected depth range exactly, so the depth attachment never wastes
+// resolution. Returns the combined lightProj * lightView so callers don't have
+// to keep the two halves around.
+//
+// Caveat: glm::ortho with GLM_FORCE_DEPTH_ZERO_TO_ONE (defined in types.h)
+// emits Vulkan-style Z∈[0,1]. We deliberately do NOT y-flip the projection
+// here — the shadow map is sampled directly via the resulting clip-space
+// position, so the Vulkan-vs-GL Y handedness cancels out as long as we treat
+// both render and sample symmetrically.
+glm::mat4 computeLightViewProj(const glm::vec3& sunDir,
+                               const glm::vec3& aabbMin,
+                               const glm::vec3& aabbMax) {
+    const glm::vec3 centre = 0.5f * (aabbMin + aabbMax);
+    // Distance along sunDir doesn't affect an ortho projection, but a non-zero
+    // offset keeps lookAt() well-defined.
+    const glm::vec3 lightEye = centre + sunDir;
+    // Avoid the degenerate up vector when the sun sits near vertical.
+    const glm::vec3 up = (std::abs(sunDir.z) > 0.99f)
+        ? glm::vec3(0.0f, 1.0f, 0.0f)
+        : glm::vec3(0.0f, 0.0f, 1.0f);
+    const glm::mat4 lightView = glm::lookAt(lightEye, centre, up);
+
+    const glm::vec3 corners[8] = {
+        {aabbMin.x, aabbMin.y, aabbMin.z}, {aabbMax.x, aabbMin.y, aabbMin.z},
+        {aabbMin.x, aabbMax.y, aabbMin.z}, {aabbMax.x, aabbMax.y, aabbMin.z},
+        {aabbMin.x, aabbMin.y, aabbMax.z}, {aabbMax.x, aabbMin.y, aabbMax.z},
+        {aabbMin.x, aabbMax.y, aabbMax.z}, {aabbMax.x, aabbMax.y, aabbMax.z},
+    };
+    constexpr float kBig = std::numeric_limits<float>::infinity();
+    glm::vec3 lsMin( kBig,  kBig,  kBig);
+    glm::vec3 lsMax(-kBig, -kBig, -kBig);
+    for (const auto& c : corners) {
+        const glm::vec3 lsC = glm::vec3(lightView * glm::vec4(c, 1.0f));
+        lsMin = glm::min(lsMin, lsC);
+        lsMax = glm::max(lsMax, lsC);
+    }
+
+    // In view space the camera looks down -Z, so a vertex with view-space Z
+    // close to -lsMax.z is the nearest and -lsMin.z is the farthest.
+    const glm::mat4 lightProj = glm::ortho(lsMin.x, lsMax.x,
+                                           lsMin.y, lsMax.y,
+                                           -lsMax.z, -lsMin.z);
+    return lightProj * lightView;
+}
+
+struct LoadedTerrain {
+    terrain::Mesh mesh;
+    dem::Tile     tile;   // kept around so we can upload the heightmap to the GPU
+};
+
+LoadedTerrain loadAndBuildTerrain() {
+    LoadedTerrain result;
     const char* path = ALPINE_SUN_MATTERHORN_TILE_PATH;
     std::printf("dem: loading %s\n", path);
-    if (!dem::loadGeoTIFF(path, tile)) {
+    if (!dem::loadGeoTIFF(path, result.tile)) {
         std::fprintf(stderr, "dem: load failed\n");
         std::exit(EXIT_FAILURE);
     }
+    const dem::Tile& tile = result.tile;
     std::printf("dem: %u x %u, lon [%.4f .. %.4f], lat [%.4f .. %.4f]\n",
                 tile.width, tile.height,
                 tile.extent.minLon, tile.extent.maxLon,
@@ -123,7 +207,8 @@ terrain::Mesh loadAndBuildTerrain() {
     // to regenerate while iterating. Drop to stride=1 for full GLO-30 detail.
     terrain::MeshOptions opts;
     opts.stride = 8;
-    terrain::Mesh mesh = terrain::makeMesh(tile, opts);
+    result.mesh = terrain::makeMesh(result.tile, opts);
+    const terrain::Mesh& mesh = result.mesh;
     std::printf("mesh: %zu verts, %zu tris, stride=%u\n",
                 mesh.vertices.size(), mesh.indices.size() / 3, opts.stride);
     std::printf("mesh: AABB min=(%.0f, %.0f, %.0f) max=(%.0f, %.0f, %.0f) m\n",
@@ -132,13 +217,15 @@ terrain::Mesh loadAndBuildTerrain() {
     std::printf("mesh: ENU origin lon=%.4f lat=%.4f, m/deg lon=%.1f lat=%.1f\n",
                 mesh.frame.centerLon, mesh.frame.centerLat,
                 mesh.frame.metresPerDegreeLon, mesh.frame.metresPerDegreeLat);
-    return mesh;
+    return result;
 }
 
 } // namespace
 
 int main() {
-    terrain::Mesh mesh = loadAndBuildTerrain();
+    LoadedTerrain loaded = loadAndBuildTerrain();
+    const terrain::Mesh& mesh = loaded.mesh;
+    const dem::Tile&     tile = loaded.tile;
 
     if (!glfwInit()) {
         std::fprintf(stderr, "glfwInit failed\n");
@@ -184,6 +271,114 @@ int main() {
     DepthImage depth = createDepthImage(gpu.allocator, gpu.device, sc.extent,
                                         VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
 
+    // ---- Sun-POV shadow map (depth-only, also sampled by terrain frag) ----
+    DepthImage shadowMap = createDepthImage(
+        gpu.allocator, gpu.device, {kShadowMapSize, kShadowMapSize},
+        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+    // Sampler config mirrors forfun_core's createShadowSampler: nearest taps
+    // (we PCF manually in the shader), CLAMP_TO_BORDER with white border so
+    // shadow-frustum-relative out-of-bounds reads come back "fully lit".
+    VkSampler shadowSampler = VK_NULL_HANDLE;
+    {
+        VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        ci.magFilter    = VK_FILTER_NEAREST;
+        ci.minFilter    = VK_FILTER_NEAREST;
+        ci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        ci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+        ci.borderColor  = VK_BORDER_COLOR_FLOAT_OPAQUE_WHITE;
+        VK_CHECK(vkCreateSampler(gpu.device, &ci, nullptr, &shadowSampler));
+    }
+
+    // ---- Heightmap texture (full-resolution DEM, R32F) ----
+    // Used only as input to the horizon-map compute bake — terrain rendering
+    // itself uses the prebaked mesh. Layout ends up SHADER_READ_ONLY_OPTIMAL.
+    VkImage         heightMapImage  = VK_NULL_HANDLE;
+    VkImageView     heightMapView   = VK_NULL_HANDLE;
+    VmaAllocation   heightMapAlloc  = VK_NULL_HANDLE;
+    VkSampler       heightMapSampler = VK_NULL_HANDLE;
+    {
+        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageCi.imageType     = VK_IMAGE_TYPE_2D;
+        imageCi.format        = VK_FORMAT_R32_SFLOAT;
+        imageCi.extent        = {tile.width, tile.height, 1};
+        imageCi.mipLevels     = 1;
+        imageCi.arrayLayers   = 1;
+        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
+        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        imageCi.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo allocCi{};
+        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
+                                &heightMapImage, &heightMapAlloc, nullptr));
+
+        VkImageViewCreateInfo viewCi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        viewCi.image            = heightMapImage;
+        viewCi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        viewCi.format           = VK_FORMAT_R32_SFLOAT;
+        viewCi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(gpu.device, &viewCi, nullptr, &heightMapView));
+
+        // Linear filter so the compute shader gets bilinear samples between
+        // DEM texels — modestly smoother bake than nearest.
+        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sCi.magFilter    = VK_FILTER_LINEAR;
+        sCi.minFilter    = VK_FILTER_LINEAR;
+        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &heightMapSampler));
+    }
+
+    // ---- Horizon map (R16F, 2D array, layer = azimuth bin) ----
+    // Storage-image-writable from the compute bake, then sampled by the
+    // terrain frag.
+    VkImage       horizonImage      = VK_NULL_HANDLE;
+    VkImageView   horizonSampleView = VK_NULL_HANDLE;  // sampled as array
+    VkImageView   horizonStorageView= VK_NULL_HANDLE;  // bound for write
+    VmaAllocation horizonAlloc      = VK_NULL_HANDLE;
+    VkSampler     horizonSampler    = VK_NULL_HANDLE;
+    {
+        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imageCi.imageType     = VK_IMAGE_TYPE_2D;
+        imageCi.format        = VK_FORMAT_R16_SFLOAT;
+        imageCi.extent        = {kHorizonMapSize, kHorizonMapSize, 1};
+        imageCi.mipLevels     = 1;
+        imageCi.arrayLayers   = kHorizonBins;
+        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
+        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo allocCi{};
+        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
+                                &horizonImage, &horizonAlloc, nullptr));
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image            = horizonImage;
+        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+        vci.format           = VK_FORMAT_R16_SFLOAT;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, kHorizonBins};
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &horizonSampleView));
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &horizonStorageView));
+
+        // Linear filter for spatial XY, but layer (bin) sampling is always
+        // nearest in Vulkan — the frag shader manually interpolates between
+        // adjacent bins instead.
+        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sCi.magFilter    = VK_FILTER_LINEAR;
+        sCi.minFilter    = VK_FILTER_LINEAR;
+        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &horizonSampler));
+    }
+
     // ---- Transient pool for one-time uploads + depth transition ----
     VkCommandPool uploadPool = VK_NULL_HANDLE;
     {
@@ -195,7 +390,10 @@ int main() {
 
     // Depth image lives in DEPTH_ATTACHMENT_OPTIMAL for its whole lifetime.
     // CLEAR loadOp handles the per-frame reset to far plane, so we don't need
-    // to transition it again.
+    // to transition it again. The shadow map goes straight to
+    // SHADER_READ_ONLY_OPTIMAL so the terrain frag's descriptor is always
+    // valid — when shadows are toggled on we re-transition it through
+    // DEPTH_ATTACHMENT_OPTIMAL each frame.
     {
         VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
         cbAi.commandPool        = uploadPool;
@@ -212,6 +410,11 @@ int main() {
                         VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
                         VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT,
                         VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+        transitionImage(cmd, shadowMap.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
         VK_CHECK(vkEndCommandBuffer(cmd));
 
         VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -233,9 +436,227 @@ int main() {
                    mesh.vertices.data(), vbBytes, terrainVB.buffer);
     uploadToBuffer(gpu.device, gpu.graphicsQueue, uploadPool, gpu.allocator,
                    mesh.indices.data(),  ibBytes, terrainIB.buffer);
-    vkDestroyCommandPool(gpu.device, uploadPool, nullptr);
     std::printf("gpu: terrain uploaded — VB %.1f MB, IB %.1f MB\n",
                 vbBytes / (1024.0 * 1024.0), ibBytes / (1024.0 * 1024.0));
+
+    // ---- Upload DEM as a sampled R32F texture (for horizon-map bake) ----
+    {
+        const VkDeviceSize demBytes =
+            static_cast<VkDeviceSize>(tile.width) * tile.height * sizeof(float);
+
+        VkBufferCreateInfo stagingCi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        stagingCi.size  = demBytes;
+        stagingCi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocCi{};
+        stagingAllocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        stagingAllocCi.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer          stagingBuf  = VK_NULL_HANDLE;
+        VmaAllocation     stagingAlloc = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingInfo{};
+        VK_CHECK(vmaCreateBuffer(gpu.allocator, &stagingCi, &stagingAllocCi,
+                                 &stagingBuf, &stagingAlloc, &stagingInfo));
+        std::memcpy(stagingInfo.pMappedData, tile.elevation.data(),
+                    static_cast<size_t>(demBytes));
+
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = uploadPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        transitionImage(cmd, heightMapImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+
+        VkBufferImageCopy region{};
+        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        region.imageExtent      = {tile.width, tile.height, 1};
+        vkCmdCopyBufferToImage(cmd, stagingBuf, heightMapImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        transitionImage(cmd, heightMapImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
+        vmaDestroyBuffer(gpu.allocator, stagingBuf, stagingAlloc);
+        std::printf("gpu: heightmap uploaded — %u x %u R32F (%.1f MB)\n",
+                    tile.width, tile.height, demBytes / (1024.0 * 1024.0));
+    }
+
+    // ---- Bake horizon map (one-time compute dispatch) ----
+    // Build a self-contained compute pipeline + descriptor set, dispatch,
+    // tear it all down. The horizon image keeps its result in
+    // SHADER_READ_ONLY_OPTIMAL for the rest of the program.
+    {
+        VkDescriptorSetLayoutBinding bakeBindings[2]{};
+        bakeBindings[0].binding         = 0;
+        bakeBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bakeBindings[0].descriptorCount = 1;
+        bakeBindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bakeBindings[1].binding         = 1;
+        bakeBindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bakeBindings[1].descriptorCount = 1;
+        bakeBindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslCi.bindingCount = 2;
+        dslCi.pBindings    = bakeBindings;
+        VkDescriptorSetLayout bakeSetLayout = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &bakeSetLayout));
+
+        VkDescriptorPoolSize bakePoolSizes[2]{};
+        bakePoolSizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bakePoolSizes[0].descriptorCount = 1;
+        bakePoolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bakePoolSizes[1].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpCi.maxSets       = 1;
+        dpCi.poolSizeCount = 2;
+        dpCi.pPoolSizes    = bakePoolSizes;
+        VkDescriptorPool bakeDescPool = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &bakeDescPool));
+
+        VkDescriptorSet bakeDescSet = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool     = bakeDescPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &bakeSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &bakeDescSet));
+
+        VkDescriptorImageInfo heightInfo{};
+        heightInfo.sampler     = heightMapSampler;
+        heightInfo.imageView   = heightMapView;
+        heightInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo horizonStoreInfo{};
+        horizonStoreInfo.imageView   = horizonStorageView;
+        horizonStoreInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet bakeWrites[2]{};
+        bakeWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        bakeWrites[0].dstSet          = bakeDescSet;
+        bakeWrites[0].dstBinding      = 0;
+        bakeWrites[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bakeWrites[0].descriptorCount = 1;
+        bakeWrites[0].pImageInfo      = &heightInfo;
+        bakeWrites[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        bakeWrites[1].dstSet          = bakeDescSet;
+        bakeWrites[1].dstBinding      = 1;
+        bakeWrites[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bakeWrites[1].descriptorCount = 1;
+        bakeWrites[1].pImageInfo      = &horizonStoreInfo;
+        vkUpdateDescriptorSets(gpu.device, 2, bakeWrites, 0, nullptr);
+
+        VkPushConstantRange bakePush{};
+        bakePush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bakePush.size       = sizeof(glm::vec4) * 2;  // aabbMinMax + params
+
+        VkPipelineLayoutCreateInfo bakePlCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        bakePlCi.setLayoutCount         = 1;
+        bakePlCi.pSetLayouts            = &bakeSetLayout;
+        bakePlCi.pushConstantRangeCount = 1;
+        bakePlCi.pPushConstantRanges    = &bakePush;
+        VkPipelineLayout bakePipelineLayout = VK_NULL_HANDLE;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &bakePlCi, nullptr, &bakePipelineLayout));
+
+        VkShaderModule bakeModule = createShaderModule(
+            gpu.device, horizon_map_comp_spv, sizeof(horizon_map_comp_spv));
+
+        VkPipelineShaderStageCreateInfo bakeStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        bakeStage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        bakeStage.module = bakeModule;
+        bakeStage.pName  = "main";
+
+        VkComputePipelineCreateInfo bakeCpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        bakeCpCi.stage  = bakeStage;
+        bakeCpCi.layout = bakePipelineLayout;
+        VkPipeline bakePipeline = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &bakeCpCi, nullptr, &bakePipeline));
+        vkDestroyShaderModule(gpu.device, bakeModule, nullptr);
+
+        // Record + submit the bake.
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = uploadPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        transitionImageRange(cmd, horizonImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                             0, 1, 0, kHorizonBins);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bakePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                bakePipelineLayout, 0, 1, &bakeDescSet, 0, nullptr);
+
+        // Push constants: (aabbMin.x, aabbMin.y, aabbMax.x, aabbMax.y),
+        // (stepDistMeters, float(maxSteps), 0, 0).
+        struct {
+            glm::vec4 aabbMinMax;
+            glm::vec4 params;
+        } push{};
+        push.aabbMinMax = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
+                                    mesh.aabbMax.x, mesh.aabbMax.y);
+        push.params     = glm::vec4(kHorizonStepDistMeters,
+                                    static_cast<float>(kHorizonMaxSteps),
+                                    0.0f, 0.0f);
+        vkCmdPushConstants(cmd, bakePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+
+        const uint32_t groupsX = (kHorizonMapSize + 7) / 8;
+        const uint32_t groupsY = (kHorizonMapSize + 7) / 8;
+        vkCmdDispatch(cmd, groupsX, groupsY, kHorizonBins);
+
+        transitionImageRange(cmd, horizonImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                             VK_IMAGE_LAYOUT_GENERAL,
+                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                             0, 1, 0, kHorizonBins);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
+
+        vkDestroyPipeline(gpu.device, bakePipeline, nullptr);
+        vkDestroyPipelineLayout(gpu.device, bakePipelineLayout, nullptr);
+        vkDestroyDescriptorPool(gpu.device, bakeDescPool, nullptr);
+        vkDestroyDescriptorSetLayout(gpu.device, bakeSetLayout, nullptr);
+        std::printf("gpu: horizon map baked — %u² × %u bins, %.0fm step × %d steps\n",
+                    kHorizonMapSize, kHorizonBins,
+                    static_cast<double>(kHorizonStepDistMeters), kHorizonMaxSteps);
+    }
+
+    vkDestroyCommandPool(gpu.device, uploadPool, nullptr);
 
     // ---- Camera UBO + per-frame descriptor sets ----
     std::array<Buffer, kFramesInFlight> cameraUbos{};
@@ -244,26 +665,39 @@ int main() {
                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    VkDescriptorSetLayoutBinding camBinding{};
-    camBinding.binding         = 0;
-    camBinding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    camBinding.descriptorCount = 1;
-    // Frag stage too — terrain.frag reads sunDirAndIrradiance from the same UBO.
-    camBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    // Three bindings in one set:
+    //   b0 = camera UBO (both stages),
+    //   b1 = shadow map sampler2D (frag),
+    //   b2 = horizon map sampler2DArray (frag).
+    VkDescriptorSetLayoutBinding setBindings[3]{};
+    setBindings[0].binding         = 0;
+    setBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    setBindings[0].descriptorCount = 1;
+    setBindings[0].stageFlags      = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+    setBindings[1].binding         = 1;
+    setBindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    setBindings[1].descriptorCount = 1;
+    setBindings[1].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    setBindings[2].binding         = 2;
+    setBindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    setBindings[2].descriptorCount = 1;
+    setBindings[2].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCi.bindingCount = 1;
-    dslCi.pBindings    = &camBinding;
+    dslCi.bindingCount = 3;
+    dslCi.pBindings    = setBindings;
     VkDescriptorSetLayout cameraSetLayout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &cameraSetLayout));
 
-    VkDescriptorPoolSize poolSize{};
-    poolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-    poolSize.descriptorCount = kFramesInFlight;
+    VkDescriptorPoolSize poolSizes[2]{};
+    poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSizes[0].descriptorCount = kFramesInFlight;
+    poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    poolSizes[1].descriptorCount = kFramesInFlight * 2;  // shadow + horizon per frame
     VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCi.maxSets       = kFramesInFlight;
-    dpCi.poolSizeCount = 1;
-    dpCi.pPoolSizes    = &poolSize;
+    dpCi.poolSizeCount = 2;
+    dpCi.pPoolSizes    = poolSizes;
     VkDescriptorPool descPool = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &descPool));
 
@@ -279,13 +713,36 @@ int main() {
         bi.buffer = cameraUbos[i].buffer;
         bi.range  = sizeof(CameraUBO);
 
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet          = cameraDescSets[i];
-        w.dstBinding      = 0;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        w.descriptorCount = 1;
-        w.pBufferInfo     = &bi;
-        vkUpdateDescriptorSets(gpu.device, 1, &w, 0, nullptr);
+        VkDescriptorImageInfo shadowInfo{};
+        shadowInfo.sampler     = shadowSampler;
+        shadowInfo.imageView   = shadowMap.view;
+        shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkDescriptorImageInfo horizonInfo{};
+        horizonInfo.sampler     = horizonSampler;
+        horizonInfo.imageView   = horizonSampleView;
+        horizonInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet writes[3]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = cameraDescSets[i];
+        writes[0].dstBinding      = 0;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        writes[0].descriptorCount = 1;
+        writes[0].pBufferInfo     = &bi;
+        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet          = cameraDescSets[i];
+        writes[1].dstBinding      = 1;
+        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo      = &shadowInfo;
+        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[2].dstSet          = cameraDescSets[i];
+        writes[2].dstBinding      = 2;
+        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[2].descriptorCount = 1;
+        writes[2].pImageInfo      = &horizonInfo;
+        vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
     }
 
     // ---- Terrain pipeline ----
@@ -384,6 +841,80 @@ int main() {
     vkDestroyShaderModule(gpu.device, vertModule, nullptr);
 
     std::printf("gpu: terrain pipeline ready\n");
+
+    // ---- Shadow (depth-only) pipeline ----
+    // Push constant carries the light-space VP matrix so the shadow pass
+    // doesn't need a descriptor set. Same vertex layout as the terrain
+    // pipeline (we draw the same VB/IB). VK_DYNAMIC_STATE_DEPTH_BIAS lets the
+    // ImGui sliders retune slope/constant bias without rebuilding the pipeline.
+    VkShaderModule depthVertModule = createShaderModule(
+        gpu.device, terrain_depth_vert_spv, sizeof(terrain_depth_vert_spv));
+
+    VkPushConstantRange shadowPush{};
+    shadowPush.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+    shadowPush.offset     = 0;
+    shadowPush.size       = sizeof(glm::mat4);
+
+    VkPipelineLayoutCreateInfo shadowPlCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    shadowPlCi.pushConstantRangeCount = 1;
+    shadowPlCi.pPushConstantRanges    = &shadowPush;
+    VkPipelineLayout shadowPipelineLayout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(gpu.device, &shadowPlCi, nullptr, &shadowPipelineLayout));
+
+    VkPipelineShaderStageCreateInfo shadowStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    shadowStage.stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    shadowStage.module = depthVertModule;
+    shadowStage.pName  = "main";
+
+    VkPipelineRasterizationStateCreateInfo shadowRs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    shadowRs.polygonMode      = VK_POLYGON_MODE_FILL;
+    shadowRs.cullMode         = VK_CULL_MODE_BACK_BIT;
+    shadowRs.frontFace        = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    shadowRs.lineWidth        = 1.0f;
+    shadowRs.depthBiasEnable  = VK_TRUE;  // actual values come via vkCmdSetDepthBias
+
+    VkPipelineMultisampleStateCreateInfo shadowMs{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    shadowMs.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo shadowDs{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    shadowDs.depthTestEnable  = VK_TRUE;
+    shadowDs.depthWriteEnable = VK_TRUE;
+    shadowDs.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendStateCreateInfo shadowCb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    // colorAttachmentCount=0 — no color output.
+
+    VkDynamicState shadowDynStates[3] = {
+        VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_DEPTH_BIAS,
+    };
+    VkPipelineDynamicStateCreateInfo shadowDyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    shadowDyn.dynamicStateCount = 3;
+    shadowDyn.pDynamicStates    = shadowDynStates;
+
+    VkPipelineRenderingCreateInfo shadowPrCi{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    shadowPrCi.colorAttachmentCount = 0;
+    shadowPrCi.depthAttachmentFormat = kDepthFormat;
+
+    VkGraphicsPipelineCreateInfo shadowGpCi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    shadowGpCi.pNext               = &shadowPrCi;
+    shadowGpCi.stageCount          = 1;
+    shadowGpCi.pStages             = &shadowStage;
+    shadowGpCi.pVertexInputState   = &vi;
+    shadowGpCi.pInputAssemblyState = &ia;
+    shadowGpCi.pViewportState      = &vp;
+    shadowGpCi.pRasterizationState = &shadowRs;
+    shadowGpCi.pMultisampleState   = &shadowMs;
+    shadowGpCi.pDepthStencilState  = &shadowDs;
+    shadowGpCi.pColorBlendState    = &shadowCb;
+    shadowGpCi.pDynamicState       = &shadowDyn;
+    shadowGpCi.layout              = shadowPipelineLayout;
+    VkPipeline shadowPipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateGraphicsPipelines(gpu.device, VK_NULL_HANDLE, 1, &shadowGpCi, nullptr, &shadowPipeline));
+
+    vkDestroyShaderModule(gpu.device, depthVertModule, nullptr);
+
+    std::printf("gpu: shadow pipeline ready (%ux%u depth map)\n",
+                kShadowMapSize, kShadowMapSize);
 
     // ---- ImGui setup ----
     // Generous pool — ImGui allocates one descriptor per font/texture and a
@@ -515,51 +1046,9 @@ int main() {
 
         forfun::FrameContext& frame = frames[frameIndex];
 
-        // 1. Wait for the previous use of this frame slot to finish.
-        VK_CHECK(vkWaitForFences(gpu.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
-        VK_CHECK(vkResetFences  (gpu.device, 1, &frame.inFlight));
-
-        // 2. Acquire a swapchain image; the imageAvailable semaphore signals
-        //    once the presentation engine releases it.
-        uint32_t imageIndex = 0;
-        VK_CHECK(vkAcquireNextImageKHR(gpu.device, sc.swapchain, UINT64_MAX,
-                                       frame.imageAvailable, VK_NULL_HANDLE, &imageIndex));
-
-        // 3. Record commands: transition to color-attachment, clear via
-        //    dynamic rendering, transition to present-src.
-        VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
-        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(frame.cmd, &beginInfo));
-
-        transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
-                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
-
-        VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        colorAttachment.imageView          = sc.imageViews[imageIndex];
-        colorAttachment.imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
-        colorAttachment.loadOp             = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_STORE;
-        colorAttachment.clearValue.color   = kClearColor;
-
-        VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
-        depthAttachment.imageView                  = depth.view;
-        depthAttachment.imageLayout                = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
-        depthAttachment.loadOp                     = VK_ATTACHMENT_LOAD_OP_CLEAR;
-        depthAttachment.storeOp                    = VK_ATTACHMENT_STORE_OP_STORE;
-        depthAttachment.clearValue.depthStencil    = {1.0f, 0};
-
-        VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
-        renderingInfo.renderArea           = {{0, 0}, sc.extent};
-        renderingInfo.layerCount           = 1;
-        renderingInfo.colorAttachmentCount = 1;
-        renderingInfo.pColorAttachments    = &colorAttachment;
-        renderingInfo.pDepthAttachment     = &depthAttachment;
-
-        // ---- ImGui: build the Sun panel for this frame ----
+        // ---- ImGui: build the Sun + Shadows panel for this frame ----
+        // Done before the command buffer opens so we can use sunSample +
+        // lightViewProj when recording the shadow pass.
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
@@ -588,6 +1077,12 @@ int main() {
             ImGui::Text("Elevation   %6.2f°", sunSample.elevationDeg);
             ImGui::Text("Irradiance  %6.0f W/m²", sunSample.irradianceWm2);
             ImGui::Text("Above horizon: %s", sunSample.elevationDeg > 0.0f ? "yes" : "no");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Occlusion");
+            ImGui::Checkbox("Shadow map",  &g_shadow.shadowMapEnabled);
+            ImGui::Checkbox("Horizon map", &g_shadow.horizonMapEnabled);
+            ImGui::SliderFloat("Bias const", &g_shadow.depthBiasConstant, 0.0f, 8.0f, "%.2f");
+            ImGui::SliderFloat("Bias slope", &g_shadow.depthBiasSlope,    0.0f, 8.0f, "%.2f");
         }
         ImGui::End();
 
@@ -601,14 +1096,129 @@ int main() {
         const float aspect = static_cast<float>(sc.extent.width)
                            / static_cast<float>(sc.extent.height);
 
+        const bool renderShadows = g_shadow.shadowMapEnabled && sunSample.directionToSun.z > 0.0f;
+
         CameraUBO cam{};
         cam.view = glm::lookAt(eye, center, upVec);
         cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
         cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
         cam.viewProj = cam.proj * cam.view;
+        cam.lightViewProj = renderShadows
+            ? computeLightViewProj(sunSample.directionToSun, mesh.aabbMin, mesh.aabbMax)
+            : glm::mat4(1.0f);
         cam.sunDirAndIrradiance = glm::vec4(sunSample.directionToSun,
                                             sunSample.irradianceWm2);
+        // .x = shadow map enabled, .y = horizon map enabled (horizon is
+        // independent of sun position so it's left on even when the sun is
+        // below the horizon — the frag handles night separately).
+        cam.occlusionParams = glm::vec4(renderShadows                ? 1.0f : 0.0f,
+                                        g_shadow.horizonMapEnabled   ? 1.0f : 0.0f,
+                                        0.0f, 0.0f);
+        cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
+                                    mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
+
+        // 1. Wait for the previous use of this frame slot to finish.
+        VK_CHECK(vkWaitForFences(gpu.device, 1, &frame.inFlight, VK_TRUE, UINT64_MAX));
+        VK_CHECK(vkResetFences  (gpu.device, 1, &frame.inFlight));
+
+        // 2. Acquire a swapchain image; the imageAvailable semaphore signals
+        //    once the presentation engine releases it.
+        uint32_t imageIndex = 0;
+        VK_CHECK(vkAcquireNextImageKHR(gpu.device, sc.swapchain, UINT64_MAX,
+                                       frame.imageAvailable, VK_NULL_HANDLE, &imageIndex));
+
+        // 3. Record commands: shadow pass (if enabled), then color+depth main
+        //    pass with terrain + ImGui, transition swapchain to present.
+        VK_CHECK(vkResetCommandBuffer(frame.cmd, 0));
+        VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(frame.cmd, &beginInfo));
+
+        // ---- Shadow pass ----
+        // Skip when shadows are disabled OR the sun is below the horizon
+        // (nothing useful to occlude). The shadow map keeps its stale
+        // contents in SHADER_READ_ONLY layout; the frag's shadowParams.x
+        // check forces visibility=1.0 in that case.
+        if (renderShadows) {
+            transitionImage(frame.cmd, shadowMap.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
+                            VK_PIPELINE_STAGE_2_EARLY_FRAGMENT_TESTS_BIT
+                                | VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+
+            VkRenderingAttachmentInfo shadowAttach{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+            shadowAttach.imageView                  = shadowMap.view;
+            shadowAttach.imageLayout                = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+            shadowAttach.loadOp                     = VK_ATTACHMENT_LOAD_OP_CLEAR;
+            shadowAttach.storeOp                    = VK_ATTACHMENT_STORE_OP_STORE;
+            shadowAttach.clearValue.depthStencil    = {1.0f, 0};
+
+            VkRenderingInfo shadowRender{VK_STRUCTURE_TYPE_RENDERING_INFO};
+            shadowRender.renderArea       = {{0, 0}, {kShadowMapSize, kShadowMapSize}};
+            shadowRender.layerCount       = 1;
+            shadowRender.pDepthAttachment = &shadowAttach;
+
+            vkCmdBeginRendering(frame.cmd, &shadowRender);
+
+            VkViewport shadowViewport{};
+            shadowViewport.width    = static_cast<float>(kShadowMapSize);
+            shadowViewport.height   = static_cast<float>(kShadowMapSize);
+            shadowViewport.minDepth = 0.0f;
+            shadowViewport.maxDepth = 1.0f;
+            vkCmdSetViewport(frame.cmd, 0, 1, &shadowViewport);
+            VkRect2D shadowScissor{{0, 0}, {kShadowMapSize, kShadowMapSize}};
+            vkCmdSetScissor(frame.cmd, 0, 1, &shadowScissor);
+            vkCmdSetDepthBias(frame.cmd, g_shadow.depthBiasConstant, 0.0f, g_shadow.depthBiasSlope);
+
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, shadowPipeline);
+            VkDeviceSize sVbOffset = 0;
+            vkCmdBindVertexBuffers(frame.cmd, 0, 1, &terrainVB.buffer, &sVbOffset);
+            vkCmdBindIndexBuffer  (frame.cmd, terrainIB.buffer, 0, VK_INDEX_TYPE_UINT32);
+            vkCmdPushConstants(frame.cmd, shadowPipelineLayout, VK_SHADER_STAGE_VERTEX_BIT,
+                               0, sizeof(glm::mat4), &cam.lightViewProj);
+            vkCmdDrawIndexed(frame.cmd, static_cast<uint32_t>(mesh.indices.size()), 1, 0, 0, 0);
+
+            vkCmdEndRendering(frame.cmd);
+
+            transitionImage(frame.cmd, shadowMap.image, VK_IMAGE_ASPECT_DEPTH_BIT,
+                            VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL,
+                            VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                            VK_PIPELINE_STAGE_2_LATE_FRAGMENT_TESTS_BIT,
+                            VK_ACCESS_2_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                            VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                            VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        }
+
+        transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
+                        VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT);
+
+        VkRenderingAttachmentInfo colorAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        colorAttachment.imageView          = sc.imageViews[imageIndex];
+        colorAttachment.imageLayout        = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL;
+        colorAttachment.loadOp             = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        colorAttachment.storeOp            = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachment.clearValue.color   = kClearColor;
+
+        VkRenderingAttachmentInfo depthAttachment{VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+        depthAttachment.imageView                  = depth.view;
+        depthAttachment.imageLayout                = VK_IMAGE_LAYOUT_DEPTH_ATTACHMENT_OPTIMAL;
+        depthAttachment.loadOp                     = VK_ATTACHMENT_LOAD_OP_CLEAR;
+        depthAttachment.storeOp                    = VK_ATTACHMENT_STORE_OP_STORE;
+        depthAttachment.clearValue.depthStencil    = {1.0f, 0};
+
+        VkRenderingInfo renderingInfo{VK_STRUCTURE_TYPE_RENDERING_INFO};
+        renderingInfo.renderArea           = {{0, 0}, sc.extent};
+        renderingInfo.layerCount           = 1;
+        renderingInfo.colorAttachmentCount = 1;
+        renderingInfo.pColorAttachments    = &colorAttachment;
+        renderingInfo.pDepthAttachment     = &depthAttachment;
 
         vkCmdBeginRendering(frame.cmd, &renderingInfo);
 
@@ -689,6 +1299,8 @@ int main() {
     ImGui::DestroyContext();
     vkDestroyDescriptorPool(gpu.device, imguiDescPool, nullptr);
 
+    vkDestroyPipeline(gpu.device, shadowPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, shadowPipelineLayout, nullptr);
     vkDestroyPipeline(gpu.device, terrainPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, pipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, descPool, nullptr);
@@ -696,6 +1308,16 @@ int main() {
     for (auto& b : cameraUbos) vmaDestroyBuffer(gpu.allocator, b.buffer, b.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
+    vkDestroySampler(gpu.device, horizonSampler, nullptr);
+    vkDestroyImageView(gpu.device, horizonStorageView, nullptr);
+    vkDestroyImageView(gpu.device, horizonSampleView,  nullptr);
+    vmaDestroyImage(gpu.allocator, horizonImage, horizonAlloc);
+    vkDestroySampler(gpu.device, heightMapSampler, nullptr);
+    vkDestroyImageView(gpu.device, heightMapView, nullptr);
+    vmaDestroyImage(gpu.allocator, heightMapImage, heightMapAlloc);
+    vkDestroySampler(gpu.device, shadowSampler, nullptr);
+    vkDestroyImageView(gpu.device, shadowMap.view, nullptr);
+    vmaDestroyImage(gpu.allocator, shadowMap.image, shadowMap.allocation);
     vkDestroyImageView(gpu.device, depth.view, nullptr);
     vmaDestroyImage(gpu.allocator, depth.image, depth.allocation);
     for (auto& f : frames) forfun::destroyFrameContext(gpu, f);

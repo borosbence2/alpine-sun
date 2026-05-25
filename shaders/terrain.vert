@@ -8,17 +8,19 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 view;
     mat4 proj;
     mat4 viewProj;
-    // xyz = unit direction TO sun in ENU; .w = clear-sky direct beam (W/m²),
-    // 0 when below horizon. Fragment shader is the only consumer; vert keeps
-    // the binding declaration matched.
+    mat4 lightViewProj;
     vec4 sunDirAndIrradiance;
+    vec4 occlusionParams;
+    vec4 terrainAabb;
 } cam;
 
 layout(location = 0) out vec3 vNormal;
 layout(location = 1) out float vHeight;
+layout(location = 2) out vec3 vWorldPos;
 
 void main() {
     gl_Position = cam.viewProj * vec4(inPos, 1.0);
     vNormal     = inNormal;
     vHeight     = inPos.z;
+    vWorldPos   = inPos;
 }

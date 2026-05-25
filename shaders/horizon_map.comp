@@ -1,0 +1,74 @@
+#version 450
+
+// Horizon-map bake. For each output texel (a world position on the terrain)
+// and each azimuth bin, raymarch outward across the DEM heightmap to find the
+// maximum apparent elevation angle of the terrain along that direction.
+//
+// At runtime the terrain frag samples this map and compares the sun's
+// elevation against the stored horizon for the current azimuth — if the sun
+// is below the horizon angle, this point is occluded by distant terrain.
+//
+// Heightmap is uploaded with the source DEM's row-major north-to-south
+// orientation, so v=0 corresponds to maxLat and v=1 to minLat. The output
+// horizon map uses the same convention so UVs are interchangeable.
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(set = 0, binding = 0) uniform sampler2D   uHeightMap;
+layout(set = 0, binding = 1, r16f) uniform image2DArray uHorizonMap;
+
+layout(push_constant) uniform Push {
+    vec4 aabbMinMax;  // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
+    vec4 params;      // .x = stepDistMeters, .y = float(maxSteps), .z,.w reserved
+} pc;
+
+const float TWO_PI = 6.28318530717958647692;
+const int   N_BINS = 32;
+
+void main() {
+    ivec3 gid     = ivec3(gl_GlobalInvocationID.xyz);
+    ivec3 outSize = imageSize(uHorizonMap);
+    if (gid.x >= outSize.x || gid.y >= outSize.y || gid.z >= outSize.z) return;
+
+    vec2 aabbMin = pc.aabbMinMax.xy;
+    vec2 aabbMax = pc.aabbMinMax.zw;
+    vec2 extent  = aabbMax - aabbMin;
+
+    // Output texel centre → world (x, y). gx grows east (+X); gy grows south
+    // (i.e. -Y in ENU), matching the DEM's row order.
+    vec2 texelF   = (vec2(gid.xy) + 0.5) / vec2(outSize.xy);
+    vec2 worldPos = vec2(aabbMin.x + texelF.x * extent.x,
+                         aabbMax.y - texelF.y * extent.y);
+
+    // Sample our starting height from the heightmap (linearly filtered).
+    vec2  startUv = vec2((worldPos.x - aabbMin.x) / extent.x,
+                         (aabbMax.y - worldPos.y) / extent.y);
+    float startH  = texture(uHeightMap, startUv).r;
+
+    // Azimuth for this bin, measured from +Y (north) clockwise. Matches the
+    // convention PSA returns (so sampling logic on the consumer side is a
+    // direct lookup, no rotation needed).
+    float az     = TWO_PI * float(gid.z) / float(N_BINS);
+    vec2  rayDir = vec2(sin(az), cos(az));
+
+    float stepDist = pc.params.x;
+    int   maxSteps = int(pc.params.y);
+
+    // -π/2 = horizon points straight down; lower bound means a flat lookout
+    // returns 0 (i.e. the sun is "above the horizon" at any positive elevation).
+    float maxAngle = -1.5708;
+    for (int step = 1; step <= maxSteps; ++step) {
+        float dist      = float(step) * stepDist;
+        vec2  samplePos = worldPos + rayDir * dist;
+        vec2  uv        = vec2((samplePos.x - aabbMin.x) / extent.x,
+                               (aabbMax.y - samplePos.y) / extent.y);
+        if (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0)))) {
+            break;  // walked off the heightmap — no further data
+        }
+        float sampleH = texture(uHeightMap, uv).r;
+        float angle   = atan(sampleH - startH, dist);
+        maxAngle      = max(maxAngle, angle);
+    }
+
+    imageStore(uHorizonMap, gid, vec4(maxAngle, 0.0, 0.0, 0.0));
+}
