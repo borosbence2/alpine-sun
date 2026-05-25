@@ -21,7 +21,9 @@
 #include "terrain.vert.h"
 #include "terrain.frag.h"
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +39,42 @@ struct alignas(16) CameraUBO {
     glm::mat4 proj;
     glm::mat4 viewProj;
 };
+
+// Orbit camera: eye orbits around `target` on a sphere of radius `distance`.
+// yaw is the compass angle from +X (east) measured CCW around +Z; pitch is the
+// elevation angle above the horizontal plane through `target`.
+struct OrbitCamera {
+    glm::vec3 target      = glm::vec3(12000.0f, 53000.0f, 2500.0f);  // near Matterhorn
+    float     yaw         = -2.356f;   // ~-135°: camera SW of target
+    float     pitch       =  0.393f;   // ~22.5° above
+    float     distance    = 30000.0f;
+    float     minDistance =   500.0f;
+    float     maxDistance = 250000.0f;
+};
+
+struct InputState {
+    bool   leftDown      = false;
+    double lastX         = 0.0;
+    double lastY         = 0.0;
+    double scrollPending = 0.0;   // GLFW scroll deltas accumulate here; consumed each frame
+};
+
+// Globals so the GLFW scroll callback can reach them. We only ever have one
+// window in this process, so a singleton is fine.
+OrbitCamera g_camera;
+InputState  g_input;
+
+void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
+    g_input.scrollPending += yoffset;
+}
+
+glm::vec3 orbitEye(const OrbitCamera& c) {
+    const float cp = std::cos(c.pitch);
+    const float sp = std::sin(c.pitch);
+    const float cy = std::cos(c.yaw);
+    const float sy = std::sin(c.yaw);
+    return c.target + c.distance * glm::vec3(cp * cy, cp * sy, sp);
+}
 
 terrain::Mesh loadAndBuildTerrain() {
     dem::Tile tile;
@@ -321,7 +359,9 @@ int main() {
 
     std::printf("gpu: terrain pipeline ready\n");
 
-    std::printf("alpine-sun: window open. Press ESC to quit.\n");
+    std::printf("alpine-sun: window open. Left-drag to orbit, scroll to zoom, ESC to quit.\n");
+
+    glfwSetScrollCallback(window, scrollCallback);
 
     // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
     // clear actually happened (vs. driver-default black).
@@ -332,6 +372,36 @@ int main() {
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
+        }
+
+        // ---- Input → orbit camera ----
+        {
+            double mx = 0.0, my = 0.0;
+            glfwGetCursorPos(window, &mx, &my);
+            const bool leftHeld = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT) == GLFW_PRESS;
+
+            if (leftHeld && g_input.leftDown) {
+                const double dx = mx - g_input.lastX;
+                const double dy = my - g_input.lastY;
+                // 0.3° per pixel feels right for this scale.
+                constexpr float kSensitivity = 0.005f;
+                g_camera.yaw   -= static_cast<float>(dx) * kSensitivity;
+                g_camera.pitch += static_cast<float>(dy) * kSensitivity;
+                // Clamp pitch just shy of the poles to avoid lookAt singularity.
+                constexpr float kPitchLimit = 1.4835f;  // ~85°
+                g_camera.pitch = std::clamp(g_camera.pitch, -kPitchLimit, kPitchLimit);
+            }
+            g_input.leftDown = leftHeld;
+            g_input.lastX    = mx;
+            g_input.lastY    = my;
+
+            if (g_input.scrollPending != 0.0) {
+                // Each scroll tick scales distance by 0.9 (in) or 1/0.9 (out).
+                const float zoom = std::pow(0.9f, static_cast<float>(g_input.scrollPending));
+                g_camera.distance = std::clamp(g_camera.distance * zoom,
+                                               g_camera.minDistance, g_camera.maxDistance);
+                g_input.scrollPending = 0.0;
+            }
         }
 
         forfun::FrameContext& frame = frames[frameIndex];
@@ -380,19 +450,17 @@ int main() {
         renderingInfo.pColorAttachments    = &colorAttachment;
         renderingInfo.pDepthAttachment     = &depthAttachment;
 
-        // ---- Camera (hardcoded view; controls arrive in A1.terrain.6) ----
-        // Look at the tile centre from the south-west, well above the highest
-        // peak so the whole massif fits in frame.
-        const glm::vec3 eye    = glm::vec3(-60000.0f, -60000.0f, 35000.0f);
-        const glm::vec3 center = glm::vec3(     0.0f,      0.0f,  2000.0f);
-        const glm::vec3 upVec  = glm::vec3(     0.0f,      0.0f,     1.0f);
+        // ---- Camera matrices from orbit state ----
+        const glm::vec3 eye    = orbitEye(g_camera);
+        const glm::vec3 center = g_camera.target;
+        const glm::vec3 upVec  = glm::vec3(0.0f, 0.0f, 1.0f);
 
         const float aspect = static_cast<float>(sc.extent.width)
                            / static_cast<float>(sc.extent.height);
 
         CameraUBO cam{};
         cam.view = glm::lookAt(eye, center, upVec);
-        cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 300000.0f);
+        cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
         cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
         cam.viewProj = cam.proj * cam.view;
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));

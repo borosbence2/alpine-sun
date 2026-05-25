@@ -77,8 +77,12 @@ controls → final scene).
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
 | A1.terrain.5  | Hand-written GLSL terrain shader (slope/height debug + fixed-sun Lambert) + graphics pipeline + draw call | DONE |
-| A1.terrain.6  | Orbit camera (target = summit) + fly mode toggle (GLFW input → camera)     | TODO   |
+| A1.terrain.6  | Orbit camera: left-drag yaw/pitch, scroll-zoom; default framed on Matterhorn. Fly mode deferred. | DONE |
 | A1.terrain.7  | Tone-mapped HDR, sky backdrop, polish                                      | TODO   |
+
+**Phase 1 functionally complete** — you can load the Matterhorn DEM, mesh it,
+render it, and orbit around. A1.terrain.7 is polish; Phase 2 (sun
+positioning via NREL SPA) is the next substantive milestone.
 
 ## Phase 2 — Sun positioning
 
