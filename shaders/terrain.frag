@@ -5,9 +5,11 @@ layout(set = 0, binding = 0) uniform Camera {
     mat4 proj;
     mat4 viewProj;
     mat4 lightViewProj;
+    mat4 invViewProj;
     vec4 sunDirAndIrradiance;  // xyz = TO sun (ENU), w = direct beam W/m²
     vec4 occlusionParams;      // .x = shadow-map enabled, .y = horizon-map enabled
     vec4 sunHoursParams;       // .x = show colormap, .y = max-hours scale
+    vec4 toneParams;           // .x = exposure (linear multiplier before ACES)
     vec4 terrainAabb;          // .xy = aabbMin, .zw = aabbMax (xy components only)
 } cam;
 
@@ -24,6 +26,14 @@ layout(location = 0) out vec4 outColor;
 const float TWO_PI       = 6.28318530717958647692;
 const float HALF_PI      = 1.57079632679;
 const int   HORIZON_BINS = 32;
+
+// Same ACES approximation as sky.frag — kept duplicated rather than including
+// across stages because shader headers are awkward in our build.
+vec3 acesFilm(vec3 c) {
+    return clamp((c * (2.51 * c + 0.03)) /
+                 (c * (2.43 * c + 0.59) + 0.14),
+                 0.0, 1.0);
+}
 
 float sampleShadow(vec4 lightClip) {
     vec3 ndc = lightClip.xyz / lightClip.w;
@@ -100,7 +110,9 @@ void main() {
     // --- Sun-hours visualisation mode ---
     // When enabled, the whole terrain reads as a viridis-mapped sun-hours/day.
     // We still apply a touch of Lambert so the shape stays legible, but the
-    // dominant signal is the colormap.
+    // dominant signal is the colormap. Skip the tonemap here so the colormap
+    // values reach the screen unchanged — the legend matches without the
+    // s-curve squashing the colours.
     if (cam.sunHoursParams.x > 0.5) {
         vec2 uv = worldToHorizonUv(vWorldPos);
         float hours = texture(uSunHours, uv).r;
@@ -139,5 +151,6 @@ void main() {
     float direct  = ndotl * aboveHorizon * visibility;
     float ambient = mix(0.05, 0.20, aboveHorizon);
 
-    outColor = vec4(albedo * (ambient + 0.75 * direct), 1.0);
+    vec3 linearColor = albedo * (ambient + 0.75 * direct);
+    outColor = vec4(acesFilm(linearColor * cam.toneParams.x), 1.0);
 }

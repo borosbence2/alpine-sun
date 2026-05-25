@@ -78,7 +78,7 @@ controls → final scene).
 |---------------|----------------------------------------------------------------------------|--------|
 | A1.terrain.5  | Hand-written GLSL terrain shader (slope/height debug + fixed-sun Lambert) + graphics pipeline + draw call | DONE |
 | A1.terrain.6  | Orbit camera: left-drag yaw/pitch, scroll-zoom; default framed on Matterhorn. Fly mode deferred. | DONE |
-| A1.terrain.7  | Tone-mapped HDR, sky backdrop, polish                                      | TODO   |
+| A1.terrain.7  | ACES tonemap (Narkowicz fit) in `terrain.frag` + `sky.frag`; sky.frag is a fullscreen-triangle pass that derives view-dirs via `invViewProj`, produces a sun-aware day/night gradient with warm horizon glow when the sun is low. Exposure slider in ImGui. Sun-hours colormap bypasses the tonemap so the legend stays faithful. | DONE |
 
 **Phase 1 functionally complete** — you can load the Matterhorn DEM, mesh it,
 render it, and orbit around. A1.terrain.7 is polish; Phase 2 (sun

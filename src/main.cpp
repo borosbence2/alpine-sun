@@ -27,6 +27,8 @@
 #include "terrain_depth.vert.h"
 #include "horizon_map.comp.h"
 #include "sun_hours.comp.h"
+#include "sky.vert.h"
+#include "sky.frag.h"
 
 #include <algorithm>
 #include <array>
@@ -50,9 +52,11 @@ struct alignas(16) CameraUBO {
     glm::mat4 proj;
     glm::mat4 viewProj;
     glm::mat4 lightViewProj;
+    glm::mat4 invViewProj;           // sky.frag reconstructs view directions from this
     glm::vec4 sunDirAndIrradiance;
     glm::vec4 occlusionParams;       // .x = shadow-map enabled, .y = horizon-map enabled
     glm::vec4 sunHoursParams;        // .x = show sun-hours colormap, .y = max-hours scale
+    glm::vec4 toneParams;            // .x = exposure (multiplier before ACES tonemap)
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
@@ -104,6 +108,10 @@ struct SunHoursUi {
     float maxHoursScale = 14.0f;   // normalises the viridis colormap
 };
 
+struct ToneUi {
+    float exposure = 1.0f;
+};
+
 // Matches the sun_hours.comp UBO layout in std140. The trailing pad keeps
 // the struct size a multiple of 16 bytes so we can sizeof() it directly.
 struct alignas(16) SunSamplesUBO {
@@ -140,6 +148,7 @@ InputState  g_input;
 SunUi       g_sun;
 ShadowUi    g_shadow;
 SunHoursUi  g_sunHours;
+ToneUi      g_tone;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -1231,6 +1240,96 @@ int main() {
     std::printf("gpu: shadow pipeline ready (%ux%u depth map)\n",
                 kShadowMapSize, kShadowMapSize);
 
+    // ---- Sky pipeline (fullscreen triangle, runs first in the main pass) ----
+    // Reuses the camera descriptor set layout: only binding 0 (UBO) is touched
+    // by sky.frag; the other bindings (samplers) are bound but unread, which
+    // is legal.
+    VkPipeline       skyPipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout skyPipelineLayout = VK_NULL_HANDLE;
+    {
+        VkShaderModule skyVertMod = createShaderModule(gpu.device,
+            sky_vert_spv, sizeof(sky_vert_spv));
+        VkShaderModule skyFragMod = createShaderModule(gpu.device,
+            sky_frag_spv, sizeof(sky_frag_spv));
+
+        VkPipelineLayoutCreateInfo skyPlCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        skyPlCi.setLayoutCount = 1;
+        skyPlCi.pSetLayouts    = &cameraSetLayout;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &skyPlCi, nullptr, &skyPipelineLayout));
+
+        VkPipelineShaderStageCreateInfo skyStages[2]{
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+        };
+        skyStages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+        skyStages[0].module = skyVertMod;
+        skyStages[0].pName  = "main";
+        skyStages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+        skyStages[1].module = skyFragMod;
+        skyStages[1].pName  = "main";
+
+        // No vertex input — gl_VertexIndex drives the fullscreen triangle.
+        VkPipelineVertexInputStateCreateInfo skyVi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+
+        VkPipelineInputAssemblyStateCreateInfo skyIa{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        skyIa.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+        VkPipelineViewportStateCreateInfo skyVp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        skyVp.viewportCount = 1;
+        skyVp.scissorCount  = 1;
+
+        VkPipelineRasterizationStateCreateInfo skyRs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        skyRs.polygonMode = VK_POLYGON_MODE_FILL;
+        skyRs.cullMode    = VK_CULL_MODE_NONE;
+        skyRs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        skyRs.lineWidth   = 1.0f;
+
+        VkPipelineMultisampleStateCreateInfo skyMs{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        skyMs.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        // Depth test off so we fill every pixel; depth write off so terrain
+        // can claim depth normally afterwards.
+        VkPipelineDepthStencilStateCreateInfo skyDs{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        skyDs.depthTestEnable  = VK_FALSE;
+        skyDs.depthWriteEnable = VK_FALSE;
+
+        VkPipelineColorBlendAttachmentState skyCba{};
+        skyCba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                              | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo skyCb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        skyCb.attachmentCount = 1;
+        skyCb.pAttachments    = &skyCba;
+
+        VkDynamicState skyDynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+        VkPipelineDynamicStateCreateInfo skyDyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        skyDyn.dynamicStateCount = 2;
+        skyDyn.pDynamicStates    = skyDynStates;
+
+        VkPipelineRenderingCreateInfo skyPrCi{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        skyPrCi.colorAttachmentCount    = 1;
+        skyPrCi.pColorAttachmentFormats = &sc.imageFormat;
+        skyPrCi.depthAttachmentFormat   = kDepthFormat;
+
+        VkGraphicsPipelineCreateInfo skyGpCi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        skyGpCi.pNext               = &skyPrCi;
+        skyGpCi.stageCount          = 2;
+        skyGpCi.pStages             = skyStages;
+        skyGpCi.pVertexInputState   = &skyVi;
+        skyGpCi.pInputAssemblyState = &skyIa;
+        skyGpCi.pViewportState      = &skyVp;
+        skyGpCi.pRasterizationState = &skyRs;
+        skyGpCi.pMultisampleState   = &skyMs;
+        skyGpCi.pDepthStencilState  = &skyDs;
+        skyGpCi.pColorBlendState    = &skyCb;
+        skyGpCi.pDynamicState       = &skyDyn;
+        skyGpCi.layout              = skyPipelineLayout;
+        VK_CHECK(vkCreateGraphicsPipelines(gpu.device, VK_NULL_HANDLE, 1, &skyGpCi, nullptr, &skyPipeline));
+
+        vkDestroyShaderModule(gpu.device, skyFragMod, nullptr);
+        vkDestroyShaderModule(gpu.device, skyVertMod, nullptr);
+    }
+    std::printf("gpu: sky pipeline ready\n");
+
     // ---- ImGui setup ----
     // Generous pool — ImGui allocates one descriptor per font/texture and a
     // few more for its internals; helmet_demo's example uses 1000-of-each
@@ -1444,6 +1543,12 @@ int main() {
             ImGui::SetItemTooltip("Hours-per-day that maps to the brightest yellow.\n"
                                   "Lower = more contrast at shaded points; higher = covers\n"
                                   "longer summer days without clipping.");
+            ImGui::Separator();
+            ImGui::TextUnformatted("Display");
+            ImGui::SliderFloat("Exposure", &g_tone.exposure, 0.25f, 4.0f, "%.2f×");
+            ImGui::SetItemTooltip("Linear multiplier before the ACES tonemap.\n"
+                                  "Higher = brighter midtones, faster roll-off into white.\n"
+                                  "Does not affect the sun-hours colormap.");
         }
         ImGui::End();
 
@@ -1476,7 +1581,8 @@ int main() {
         cam.view = glm::lookAt(eye, center, upVec);
         cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
         cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
-        cam.viewProj = cam.proj * cam.view;
+        cam.viewProj    = cam.proj * cam.view;
+        cam.invViewProj = glm::inverse(cam.viewProj);
         cam.lightViewProj = renderShadows
             ? computeLightViewProj(sunSample.directionToSun, mesh.aabbMin, mesh.aabbMax)
             : glm::mat4(1.0f);
@@ -1491,6 +1597,7 @@ int main() {
         cam.sunHoursParams = glm::vec4(g_sunHours.enabled ? 1.0f : 0.0f,
                                        g_sunHours.maxHoursScale,
                                        0.0f, 0.0f);
+        cam.toneParams = glm::vec4(g_tone.exposure, 0.0f, 0.0f, 0.0f);
         cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
                                     mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
@@ -1611,6 +1718,15 @@ int main() {
         VkRect2D scissor{{0, 0}, sc.extent};
         vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
 
+        // ---- Sky pass ----
+        // Fullscreen triangle. No depth write, no vertex inputs. Filled first
+        // so the terrain (which writes depth normally) can overdraw it. The
+        // existing colour-attachment clear is now functionally dead but cheap.
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, skyPipeline);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                skyPipelineLayout, 0, 1, &cameraDescSets[frameIndex], 0, nullptr);
+        vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+
         vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline);
         vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 pipelineLayout, 0, 1, &cameraDescSets[frameIndex], 0, nullptr);
@@ -1676,6 +1792,8 @@ int main() {
     ImGui::DestroyContext();
     vkDestroyDescriptorPool(gpu.device, imguiDescPool, nullptr);
 
+    vkDestroyPipeline(gpu.device, skyPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, skyPipelineLayout, nullptr);
     vkDestroyPipeline(gpu.device, shadowPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, shadowPipelineLayout, nullptr);
     vkDestroyPipeline(gpu.device, terrainPipeline, nullptr);
