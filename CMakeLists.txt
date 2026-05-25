@@ -217,6 +217,8 @@ add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.vert"           s
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag"           sky_frag_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/route.vert"         route_vert_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/route.frag"         route_frag_spv)
+add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/transmittance.comp" transmittance_comp_spv)
+add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky_view.comp"      sky_view_comp_spv)
 
 if(MSVC)
     target_compile_options(alpine_sun PRIVATE /W4 /permissive-)

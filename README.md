@@ -66,10 +66,11 @@ Everything lands under `assets/` and `src/vendor/`, both gitignored.
 
 | Input             | Action                                                     |
 |-------------------|------------------------------------------------------------|
+| Hover             | Floating tooltip with lat/lon/elevation/sun-hours          |
 | Left-drag         | Orbit the camera around the look-at target                 |
 | Middle-drag       | Pan the look-at target in the screen plane                 |
 | Scroll wheel      | Zoom (changes orbit distance)                              |
-| Right-click       | Sample the picked point's sun-hours, lat/lon, elevation    |
+| Right-click       | Pin a sample to the side panel (lat/lon/elev/hours)        |
 | Drop a `.gpx`     | Load that route, draped on the terrain                     |
 | ESC               | Quit                                                       |
 
@@ -120,7 +121,9 @@ Lives on the left side of the window. Sections from top to bottom:
 - **Display**: ACES exposure, satellite-albedo toggle (when imagery is
   bundled for the preset).
 - **Picked point**: appears once you right-click anywhere — lat/lon,
-  elevation, sun-hours/day for that exact spot.
+  elevation, sun-hours/day for that exact spot. The floating tooltip that
+  follows the cursor shows the same values live; the picked panel is for
+  when you want a value to stay put.
 - **Route**: status + visibility checkbox + collapsible per-waypoint table
   with index, lat, lon, elevation, sun-hours/day.
 
@@ -149,14 +152,30 @@ procedural shading with a viridis-mapped readout, and the same data is read
 back into a 1 MB host buffer so the route's per-waypoint sun-hours table is
 just a CPU lookup.
 
-### Sky + tonemap
+### Atmospheric sky + tonemap
 
-A fullscreen-triangle sky pipeline draws first inside the main render pass.
-Sky.frag back-projects each fragment's NDC through `invViewProj` to get a
-view direction; produces a day/night gradient with a warm horizon glow
-where the sun azimuth aligns with the view direction at low sun elevations.
+A physically-based sky in the Hillaire 2020 style. Two pre-baked LUTs feed
+a fullscreen-triangle sky pass:
+
+- **Transmittance LUT** (256×64): one-shot at startup. Maps `(cos viewZenith,
+  altitude)` → RGB transmittance through the atmosphere. Earth-tuned
+  constants for Rayleigh, Mie and ozone extinction.
+- **Sky-view LUT** (192×108): rebaked whenever the sun's direction drifts
+  more than ~0.5°. Single-scattering integration along each direction from
+  the observer, with phase functions sampled at the current sun angle.
+
+`sky.frag` reconstructs the view direction from `invViewProj`, looks up the
+sky-view LUT with horizon-biased non-linear v sampling, and punches a small
+sun disk where the view direction lines up with the sun. The result is
+proper Rayleigh blue, warm reddening near the horizon at low sun, and a
+deep cool sky at night — without any of the ad-hoc gradient math the
+previous procedural sky used.
+
 Both sky and terrain pass through the same ACES (Narkowicz fit) tonemap
 with a user-controlled exposure.
+
+Not yet implemented: multi-scattering LUT and aerial perspective. The
+single-scattering single-bounce result already covers the dominant visual.
 
 ### GPX routes
 
@@ -182,31 +201,41 @@ configure time). Stored as `R8G8B8A8_SRGB` so the sampler does sRGB→linear,
 then the same ACES tonemap applies. Same world-XY→UV mapping as the
 horizon and sun-hours samplers.
 
-### Picking
+### Picking + hover
 
-Right-click on the terrain. The depth attachment is copied to a host buffer
-at the end of the same frame; the picked NDC is reconstructed through
-`invViewProj`, mapped to lat/lon via the ENU frame, and the sun-hours
-texture is sampled at that point. Clicking on the sky is silently ignored.
+Hover any spot on the terrain to see a small four-line tooltip next to the
+cursor with lat / lon / elevation / sun-hours. The hover does a **CPU
+ray-march** against the DEM (50 m step + binary refine; tens of
+microseconds per frame), so no GPU stall.
+
+Right-click works the same way but the result *pins* to the side panel
+instead of chasing the cursor. The picking path uses depth-buffer readback
+of the rendered frame: depth attachment → 1-texel copy → unproject via
+`invViewProj`. Clicking on the sky is silently ignored.
+
+Both paths sample the same CPU-resident sun-hours readback buffer for the
+hours/day number, so they're internally consistent.
 
 ---
 
 ## Architecture
 
-- Single executable, ~2.6k LOC of `main.cpp` plus small files for the GPX
+- Single executable, ~3.2k LOC of `main.cpp` plus small files for the GPX
   parser, DEM loader, terrain mesh, geo frame, PSA, and sun driver.
 - Built on top of `forfun_core` (from the sibling `forfun-graphics` repo) —
   reuses Device, Swapchain, FrameContext, VMA helpers, transitionImage,
   buffer/image upload, shader compilation pipeline, ImGui static lib.
-- One descriptor set with five bindings drives the terrain pipeline:
+- One descriptor set with six bindings drives the terrain pipeline:
   camera UBO, shadow map sampler, horizon map sampler2DArray, sun-hours
-  sampler2D, satellite sampler2D.
-- Seven shaders: `terrain.vert` + `terrain.frag`, `terrain_depth.vert`
+  sampler2D, satellite sampler2D, sky-view LUT sampler2D.
+- Nine shaders: `terrain.vert` + `terrain.frag`, `terrain_depth.vert`
   (shadow pass, push-constant matrix), `sky.vert` + `sky.frag`,
-  `route.vert` + `route.frag`, `horizon_map.comp`, `sun_hours.comp`.
+  `route.vert` + `route.frag`, `horizon_map.comp`, `sun_hours.comp`,
+  `transmittance.comp`, `sky_view.comp`.
 - All compute work runs at startup or only when a depending parameter
-  changes — horizon map is one-shot, sun-hours rebakes whenever the date
-  or location updates.
+  changes — horizon map and transmittance LUT are one-shot, sun-hours
+  rebakes when date/location updates, sky-view rebakes when the sun's
+  direction drifts more than ~0.5°.
 
 See [`MILESTONES.md`](MILESTONES.md) for a detailed log of every milestone
 and the design choices behind it.
@@ -240,8 +269,8 @@ Phases 0 through 5 substantively complete — see
 [`MILESTONES.md`](MILESTONES.md) for the per-task log. Remaining open items:
 
 - `A3.occ.6` — optional ray-traced sharp shadows via `VK_KHR_ray_tracing_pipeline`.
-- `A5.use.4` — physically-based atmosphere (Hillaire 2020).
 - `A5.use.5` — save/load scenario JSON.
+- Hillaire follow-ups — multi-scattering LUT and aerial-perspective volume.
 - Phase 6 polish — quadtree LOD, glacier mask overlay, cloud shadows,
   photogrammetry import.
 

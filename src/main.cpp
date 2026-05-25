@@ -36,6 +36,8 @@
 #include "sky.frag.h"
 #include "route.vert.h"
 #include "route.frag.h"
+#include "transmittance.comp.h"
+#include "sky_view.comp.h"
 
 #include <algorithm>
 #include <array>
@@ -113,6 +115,14 @@ constexpr int      kHorizonMaxSteps       = 128;
 constexpr uint32_t kSunHoursMapSize = 512;
 constexpr uint32_t kMaxSunSamples   = 256;
 
+// Hillaire-style atmosphere LUTs.
+//   Transmittance is one-shot at startup, never recomputed.
+//   Sky-view rebakes when the sun direction or observer altitude changes.
+constexpr uint32_t kTransmittanceLutW = 256;
+constexpr uint32_t kTransmittanceLutH = 64;
+constexpr uint32_t kSkyViewLutW       = 192;
+constexpr uint32_t kSkyViewLutH       = 108;
+
 struct SunHoursUi {
     bool  enabled       = false;
     float stepMinutes   = 10.0f;   // 144 samples/day at the default
@@ -163,6 +173,19 @@ struct PickResult {
     float     sunHours  = 0.0f;
 };
 
+// Hover sample — recomputed every frame via CPU ray-march against the DEM.
+// Cheap (~microseconds) so we don't need to gate it behind a click.
+struct HoverResult {
+    bool      valid     = false;
+    glm::vec3 worldPos  = glm::vec3(0.0f);
+    double    latDeg    = 0.0;
+    double    lonDeg    = 0.0;
+    float     elevation = 0.0f;
+    float     sunHours  = 0.0f;
+    double    cursorX   = 0.0;   // window pixels — used to place the tooltip
+    double    cursorY   = 0.0;
+};
+
 // Matches the sun_hours.comp UBO layout in std140. The trailing pad keeps
 // the struct size a multiple of 16 bytes so we can sizeof() it directly.
 struct alignas(16) SunSamplesUBO {
@@ -204,6 +227,7 @@ SunHoursUi  g_sunHours;
 ToneUi      g_tone;
 PickRequest    g_pickRequest;
 PickResult     g_pickResult;
+HoverResult    g_hover;
 PendingGpxLoad g_pendingGpx;     // populated by the GLFW drop callback; consumed at top of loop
 Route          g_route;
 SatUi          g_sat;
@@ -1374,6 +1398,348 @@ int main(int argc, char** argv) {
     // Initial bake so the descriptor binding is always backed by valid data.
     runSunHoursBake();
 
+    // =====================================================================
+    // Hillaire atmospheric LUTs
+    // =====================================================================
+    // ---- Transmittance LUT (R16G16B16A16F, 256×64) ----
+    VkImage       transImage      = VK_NULL_HANDLE;
+    VkImageView   transStorageView= VK_NULL_HANDLE;
+    VkImageView   transSampleView = VK_NULL_HANDLE;
+    VmaAllocation transAlloc      = VK_NULL_HANDLE;
+    VkSampler     transSampler    = VK_NULL_HANDLE;
+    {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType     = VK_IMAGE_TYPE_2D;
+        ci.format        = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.extent        = {kTransmittanceLutW, kTransmittanceLutH, 1};
+        ci.mipLevels     = 1;
+        ci.arrayLayers   = 1;
+        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo ac{};
+        ac.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &ci, &ac, &transImage, &transAlloc, nullptr));
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image            = transImage;
+        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format           = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &transStorageView));
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &transSampleView));
+
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sci, nullptr, &transSampler));
+    }
+
+    // ---- Sky-view LUT (R16G16B16A16F, 192×108) ----
+    VkImage       skyViewImage      = VK_NULL_HANDLE;
+    VkImageView   skyViewStorageView= VK_NULL_HANDLE;
+    VkImageView   skyViewSampleView = VK_NULL_HANDLE;
+    VmaAllocation skyViewAlloc      = VK_NULL_HANDLE;
+    VkSampler     skyViewSampler    = VK_NULL_HANDLE;
+    {
+        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        ci.imageType     = VK_IMAGE_TYPE_2D;
+        ci.format        = VK_FORMAT_R16G16B16A16_SFLOAT;
+        ci.extent        = {kSkyViewLutW, kSkyViewLutH, 1};
+        ci.mipLevels     = 1;
+        ci.arrayLayers   = 1;
+        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
+        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        ci.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo ac{};
+        ac.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &ci, &ac, &skyViewImage, &skyViewAlloc, nullptr));
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image            = skyViewImage;
+        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format           = VK_FORMAT_R16G16B16A16_SFLOAT;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &skyViewStorageView));
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &skyViewSampleView));
+
+        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sci.magFilter    = VK_FILTER_LINEAR;
+        sci.minFilter    = VK_FILTER_LINEAR;
+        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;     // azimuth wraps
+        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sci, nullptr, &skyViewSampler));
+    }
+
+    // ---- Transmittance bake (one-shot at startup) ----
+    {
+        VkDescriptorSetLayoutBinding b{};
+        b.binding         = 0;
+        b.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        b.descriptorCount = 1;
+        b.stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslCi.bindingCount = 1;
+        dslCi.pBindings    = &b;
+        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &dsl));
+
+        VkDescriptorPoolSize ps{};
+        ps.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        ps.descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpCi.maxSets       = 1;
+        dpCi.poolSizeCount = 1;
+        dpCi.pPoolSizes    = &ps;
+        VkDescriptorPool pool = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &pool));
+
+        VkDescriptorSet set = VK_NULL_HANDLE;
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool     = pool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &dsl;
+        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &set));
+
+        VkDescriptorImageInfo storeInfo{};
+        storeInfo.imageView   = transStorageView;
+        storeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet          = set;
+        w.dstBinding      = 0;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        w.descriptorCount = 1;
+        w.pImageInfo      = &storeInfo;
+        vkUpdateDescriptorSets(gpu.device, 1, &w, 0, nullptr);
+
+        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plCi.setLayoutCount = 1;
+        plCi.pSetLayouts    = &dsl;
+        VkPipelineLayout plLayout = VK_NULL_HANDLE;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &plLayout));
+
+        VkShaderModule mod = createShaderModule(gpu.device,
+            transmittance_comp_spv, sizeof(transmittance_comp_spv));
+        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = mod;
+        stage.pName  = "main";
+        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpCi.stage  = stage;
+        cpCi.layout = plLayout;
+        VkPipeline pipeline = VK_NULL_HANDLE;
+        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &pipeline));
+        vkDestroyShaderModule(gpu.device, mod, nullptr);
+
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = sunHoursPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        transitionImage(cmd, transImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                plLayout, 0, 1, &set, 0, nullptr);
+        vkCmdDispatch(cmd, (kTransmittanceLutW + 7) / 8, (kTransmittanceLutH + 7) / 8, 1);
+        transitionImage(cmd, transImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                            | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
+
+        vkDestroyPipeline(gpu.device, pipeline, nullptr);
+        vkDestroyPipelineLayout(gpu.device, plLayout, nullptr);
+        vkDestroyDescriptorPool(gpu.device, pool, nullptr);
+        vkDestroyDescriptorSetLayout(gpu.device, dsl, nullptr);
+        std::printf("gpu: transmittance LUT baked — %u x %u RGBA16F\n",
+                    kTransmittanceLutW, kTransmittanceLutH);
+    }
+
+    // ---- Sky-view bake (persistent pipeline — rerun whenever sun moves) ----
+    VkDescriptorSetLayout skyViewSetLayout = VK_NULL_HANDLE;
+    VkDescriptorPool      skyViewDescPool  = VK_NULL_HANDLE;
+    VkDescriptorSet       skyViewDescSet   = VK_NULL_HANDLE;
+    VkPipelineLayout      skyViewPipelineLayout = VK_NULL_HANDLE;
+    VkPipeline            skyViewPipeline       = VK_NULL_HANDLE;
+    {
+        VkDescriptorSetLayoutBinding bindings[2]{};
+        bindings[0].binding         = 0;
+        bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        bindings[0].descriptorCount = 1;
+        bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[1].binding         = 1;
+        bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        bindings[1].descriptorCount = 1;
+        bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
+
+        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        dslCi.bindingCount = 2;
+        dslCi.pBindings    = bindings;
+        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &skyViewSetLayout));
+
+        VkDescriptorPoolSize ps[2]{};
+        ps[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        ps[0].descriptorCount = 1;
+        ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        ps[1].descriptorCount = 1;
+        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+        dpCi.maxSets       = 1;
+        dpCi.poolSizeCount = 2;
+        dpCi.pPoolSizes    = ps;
+        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &skyViewDescPool));
+
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool     = skyViewDescPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &skyViewSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &skyViewDescSet));
+
+        VkDescriptorImageInfo transInfo{};
+        transInfo.sampler     = transSampler;
+        transInfo.imageView   = transSampleView;
+        transInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+        VkDescriptorImageInfo storeInfo{};
+        storeInfo.imageView   = skyViewStorageView;
+        storeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        VkWriteDescriptorSet writes[2]{};
+        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[0].dstSet          = skyViewDescSet;
+        writes[0].dstBinding      = 0;
+        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[0].descriptorCount = 1;
+        writes[0].pImageInfo      = &transInfo;
+        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[1].dstSet          = skyViewDescSet;
+        writes[1].dstBinding      = 1;
+        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+        writes[1].descriptorCount = 1;
+        writes[1].pImageInfo      = &storeInfo;
+        vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
+
+        VkPushConstantRange pcr{};
+        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        pcr.size       = sizeof(glm::vec4) * 2;   // sunDir + observer params
+
+        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plCi.setLayoutCount         = 1;
+        plCi.pSetLayouts            = &skyViewSetLayout;
+        plCi.pushConstantRangeCount = 1;
+        plCi.pPushConstantRanges    = &pcr;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &skyViewPipelineLayout));
+
+        VkShaderModule mod = createShaderModule(gpu.device,
+            sky_view_comp_spv, sizeof(sky_view_comp_spv));
+        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
+        stage.module = mod;
+        stage.pName  = "main";
+        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+        cpCi.stage  = stage;
+        cpCi.layout = skyViewPipelineLayout;
+        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &skyViewPipeline));
+        vkDestroyShaderModule(gpu.device, mod, nullptr);
+    }
+
+    // Sun direction that the sky-view LUT was last baked against. Compared
+    // against each frame's current sun direction; the LUT rebakes when they
+    // diverge by more than a fraction of a degree.
+    glm::vec3 lastSkyBakeSunDir(0.0f);
+    bool      skyViewBaked = false;
+
+    auto runSkyViewBake = [&](const glm::vec3& sunDir, float observerAltM) {
+        // First bake transitions UNDEFINED → GENERAL; subsequent ones go from
+        // SHADER_READ_ONLY → GENERAL → SHADER_READ_ONLY.
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = sunHoursPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+
+        // Discard previous contents — every texel is overwritten.
+        transitionImage(cmd, skyViewImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, skyViewPipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                skyViewPipelineLayout, 0, 1, &skyViewDescSet, 0, nullptr);
+
+        struct {
+            glm::vec4 sunDir;
+            glm::vec4 observer;
+        } push{};
+        push.sunDir   = glm::vec4(sunDir, 0.0f);
+        push.observer = glm::vec4(observerAltM, 0.0f, 0.0f, 0.0f);
+        vkCmdPushConstants(cmd, skyViewPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
+                           0, sizeof(push), &push);
+        vkCmdDispatch(cmd, (kSkyViewLutW + 7) / 8, (kSkyViewLutH + 7) / 8, 1);
+
+        transitionImage(cmd, skyViewImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+
+        VK_CHECK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
+
+        lastSkyBakeSunDir = sunDir;
+        skyViewBaked      = true;
+    };
+
+    // Initial sky-view bake using the preset's starting sun.
+    {
+        const sun::Sample s0 = sun::compute(
+            g_sun.latDeg, g_sun.lonDeg,
+            g_sun.year,   g_sun.month, g_sun.day,
+            g_sun.localHour, g_sun.tzOffsetH);
+        runSkyViewBake(s0.directionToSun, mesh.aabbMax.z * 0.5f);
+        std::printf("gpu: sky-view LUT baked — %u x %u RGBA16F\n",
+                    kSkyViewLutW, kSkyViewLutH);
+    }
+
     // ---- Camera UBO + per-frame descriptor sets ----
     std::array<Buffer, kFramesInFlight> cameraUbos{};
     for (auto& b : cameraUbos) {
@@ -1381,13 +1747,14 @@ int main(int argc, char** argv) {
                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    // Five bindings in one set:
+    // Six bindings in one set:
     //   b0 = camera UBO (both stages),
     //   b1 = shadow map sampler2D (frag),
     //   b2 = horizon map sampler2DArray (frag),
     //   b3 = sun-hours sampler2D (frag),
-    //   b4 = satellite imagery sampler2D (frag).
-    VkDescriptorSetLayoutBinding setBindings[5]{};
+    //   b4 = satellite imagery sampler2D (frag),
+    //   b5 = sky-view LUT sampler2D (frag).
+    VkDescriptorSetLayoutBinding setBindings[6]{};
     setBindings[0].binding         = 0;
     setBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     setBindings[0].descriptorCount = 1;
@@ -1408,9 +1775,13 @@ int main(int argc, char** argv) {
     setBindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     setBindings[4].descriptorCount = 1;
     setBindings[4].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    setBindings[5].binding         = 5;
+    setBindings[5].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    setBindings[5].descriptorCount = 1;
+    setBindings[5].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCi.bindingCount = 5;
+    dslCi.bindingCount = 6;
     dslCi.pBindings    = setBindings;
     VkDescriptorSetLayout cameraSetLayout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &cameraSetLayout));
@@ -1419,7 +1790,7 @@ int main(int argc, char** argv) {
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFramesInFlight;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * 4;  // shadow + horizon + sun-hours + sat per frame
+    poolSizes[1].descriptorCount = kFramesInFlight * 5;  // shadow + horizon + sun-hours + sat + sky-view
     VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCi.maxSets       = kFramesInFlight;
     dpCi.poolSizeCount = 2;
@@ -1459,7 +1830,12 @@ int main(int argc, char** argv) {
         satInfo.imageView   = satView;
         satInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[5]{};
+        VkDescriptorImageInfo skyViewInfo{};
+        skyViewInfo.sampler     = skyViewSampler;
+        skyViewInfo.imageView   = skyViewSampleView;
+        skyViewInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet writes[6]{};
         writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet          = cameraDescSets[i];
         writes[0].dstBinding      = 0;
@@ -1490,7 +1866,13 @@ int main(int argc, char** argv) {
         writes[4].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[4].descriptorCount = 1;
         writes[4].pImageInfo      = &satInfo;
-        vkUpdateDescriptorSets(gpu.device, 5, writes, 0, nullptr);
+        writes[5].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[5].dstSet          = cameraDescSets[i];
+        writes[5].dstBinding      = 5;
+        writes[5].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[5].descriptorCount = 1;
+        writes[5].pImageInfo      = &skyViewInfo;
+        vkUpdateDescriptorSets(gpu.device, 6, writes, 0, nullptr);
     }
 
     // ---- Terrain pipeline ----
@@ -2099,12 +2481,134 @@ int main(int argc, char** argv) {
 
         forfun::FrameContext& frame = frames[frameIndex];
 
+        // ---- Camera matrices (geometry only, sun fields filled later) ----
+        // Computed early so the cursor-hover ray-march can use invViewProj
+        // before the ImGui block builds its tooltip.
+        const glm::vec3 eye    = orbitEye(g_camera);
+        const glm::vec3 center = g_camera.target;
+        const glm::vec3 upVec  = glm::vec3(0.0f, 0.0f, 1.0f);
+        const float aspect = static_cast<float>(sc.extent.width)
+                           / static_cast<float>(sc.extent.height);
+        const glm::mat4 viewMat  = glm::lookAt(eye, center, upVec);
+        glm::mat4       projMat  = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
+        projMat[1][1] *= -1.0f;
+        const glm::mat4 viewProjMat    = projMat * viewMat;
+        const glm::mat4 invViewProjMat = glm::inverse(viewProjMat);
+
+        // ---- Hover ray-march ----
+        // CPU march of cursor ray against the DEM. Step 50 m, then a binary
+        // refine; total cost is tens of microseconds for the worst-case
+        // 30 km traversal. Skipped when the cursor is over an ImGui panel
+        // or outside the window.
+        g_hover = HoverResult{};
+        {
+            double mx = 0.0, my = 0.0;
+            glfwGetCursorPos(window, &mx, &my);
+            const bool inWindow = mx >= 0.0 && my >= 0.0
+                && mx <  double(sc.extent.width)
+                && my <  double(sc.extent.height);
+            if (inWindow && !ImGui::GetIO().WantCaptureMouse) {
+                const float ndcX = float(2.0 * (mx + 0.5) / sc.extent.width  - 1.0);
+                const float ndcY = float(2.0 * (my + 0.5) / sc.extent.height - 1.0);
+                const glm::vec4 nearH = invViewProjMat * glm::vec4(ndcX, ndcY, 0.0f, 1.0f);
+                const glm::vec4 farH  = invViewProjMat * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
+                const glm::vec3 rayO  = glm::vec3(nearH) / nearH.w;
+                const glm::vec3 rayE  = glm::vec3(farH)  / farH.w;
+                const glm::vec3 rayD  = glm::normalize(rayE - rayO);
+                const float maxT = glm::length(rayE - rayO);
+
+                constexpr float kStep = 50.0f;
+                const float aabbMaxZ = mesh.aabbMax.z;
+                float prevT = 0.0f;
+                float hitLo = -1.0f, hitHi = -1.0f;
+                for (float t = kStep; t < maxT; t += kStep) {
+                    const glm::vec3 p = rayO + rayD * t;
+                    // Far above any terrain — keep marching without sampling.
+                    if (p.z > aabbMaxZ) { prevT = t; continue; }
+                    const double lon = mesh.frame.centerLon
+                                     + double(p.x) / mesh.frame.metresPerDegreeLon;
+                    const double lat = mesh.frame.centerLat
+                                     + double(p.y) / mesh.frame.metresPerDegreeLat;
+                    const float h = sampleDemBilinear(tile, lon, lat);
+                    if (p.z < h) { hitLo = prevT; hitHi = t; break; }
+                    prevT = t;
+                }
+                if (hitHi > 0.0f) {
+                    for (int i = 0; i < 12; ++i) {
+                        const float mid = 0.5f * (hitLo + hitHi);
+                        const glm::vec3 p = rayO + rayD * mid;
+                        const double lon = mesh.frame.centerLon
+                                         + double(p.x) / mesh.frame.metresPerDegreeLon;
+                        const double lat = mesh.frame.centerLat
+                                         + double(p.y) / mesh.frame.metresPerDegreeLat;
+                        const float h = sampleDemBilinear(tile, lon, lat);
+                        if (p.z < h) hitHi = mid;
+                        else         hitLo = mid;
+                    }
+                    const glm::vec3 hit = rayO + rayD * (0.5f * (hitLo + hitHi));
+                    const double lon = mesh.frame.centerLon
+                                     + double(hit.x) / mesh.frame.metresPerDegreeLon;
+                    const double lat = mesh.frame.centerLat
+                                     + double(hit.y) / mesh.frame.metresPerDegreeLat;
+                    const float elev = sampleDemBilinear(tile, lon, lat);
+
+                    g_hover.valid     = true;
+                    g_hover.worldPos  = hit;
+                    g_hover.lonDeg    = lon;
+                    g_hover.latDeg    = lat;
+                    g_hover.elevation = elev;
+                    g_hover.cursorX   = mx;
+                    g_hover.cursorY   = my;
+
+                    // Sun-hours from the CPU readback (kept fresh by the
+                    // sun-hours bake at startup + on param change).
+                    const float u = (hit.x - mesh.aabbMin.x)
+                                  / (mesh.aabbMax.x - mesh.aabbMin.x);
+                    const float v = (mesh.aabbMax.y - hit.y)
+                                  / (mesh.aabbMax.y - mesh.aabbMin.y);
+                    if (u >= 0.0f && u <= 1.0f && v >= 0.0f && v <= 1.0f) {
+                        const int x = std::clamp(int(u * kSunHoursMapSize),
+                                                 0, int(kSunHoursMapSize) - 1);
+                        const int y = std::clamp(int(v * kSunHoursMapSize),
+                                                 0, int(kSunHoursMapSize) - 1);
+                        const float* data = static_cast<const float*>(sunHoursReadback.mapped);
+                        g_hover.sunHours = data[y * kSunHoursMapSize + x];
+                    }
+                }
+            }
+        }
+
         // ---- ImGui: build the Sun + Shadows panel for this frame ----
         // Done before the command buffer opens so we can use sunSample +
         // lightViewProj when recording the shadow pass.
         ImGui_ImplVulkan_NewFrame();
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
+
+        // ---- Cursor tooltip ----
+        // Floats next to the cursor when hovering terrain, four lines of
+        // readout (lat/lon/elev/sun). NoInputs/NoMove so it can't steal
+        // clicks from the picking path or get dragged around.
+        if (g_hover.valid) {
+            ImGui::SetNextWindowPos(ImVec2(float(g_hover.cursorX + 16.0),
+                                           float(g_hover.cursorY + 16.0)),
+                                    ImGuiCond_Always);
+            ImGui::SetNextWindowBgAlpha(0.82f);
+            const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration
+                                         | ImGuiWindowFlags_AlwaysAutoResize
+                                         | ImGuiWindowFlags_NoSavedSettings
+                                         | ImGuiWindowFlags_NoFocusOnAppearing
+                                         | ImGuiWindowFlags_NoNav
+                                         | ImGuiWindowFlags_NoMove
+                                         | ImGuiWindowFlags_NoInputs;
+            if (ImGui::Begin("##hover_tip", nullptr, flags)) {
+                ImGui::Text("Lat  %9.5f°",      g_hover.latDeg);
+                ImGui::Text("Lon  %9.5f°",      g_hover.lonDeg);
+                ImGui::Text("Elev %5.0f m",      g_hover.elevation);
+                ImGui::Text("Sun  %5.2f h/day", double(g_hover.sunHours));
+            }
+            ImGui::End();
+        }
 
         const sun::Sample sunSample = sun::compute(
             g_sun.latDeg, g_sun.lonDeg,
@@ -2267,22 +2771,24 @@ int main(int argc, char** argv) {
             runSunHoursBake();
         }
 
-        // ---- Camera matrices from orbit state ----
-        const glm::vec3 eye    = orbitEye(g_camera);
-        const glm::vec3 center = g_camera.target;
-        const glm::vec3 upVec  = glm::vec3(0.0f, 0.0f, 1.0f);
+        // Sky-view rebake whenever the sun's direction drifts noticeably.
+        // 0.5° threshold (cos > 0.99996) avoids re-doing the bake every frame
+        // while keeping the sky in sync as the user scrubs time.
+        const float skyDotLast = glm::dot(sunSample.directionToSun, lastSkyBakeSunDir);
+        if (!skyViewBaked || skyDotLast < 0.99996f) {
+            runSkyViewBake(sunSample.directionToSun, mesh.aabbMax.z * 0.5f);
+        }
 
-        const float aspect = static_cast<float>(sc.extent.width)
-                           / static_cast<float>(sc.extent.height);
-
+        // ---- Camera matrices (sun fields) ----
+        // Geometry pieces (view/proj/viewProj/invViewProj) were already
+        // computed up top for the hover ray-march; reuse them here.
         const bool renderShadows = g_shadow.shadowMapEnabled && sunSample.directionToSun.z > 0.0f;
 
         CameraUBO cam{};
-        cam.view = glm::lookAt(eye, center, upVec);
-        cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 400000.0f);
-        cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
-        cam.viewProj    = cam.proj * cam.view;
-        cam.invViewProj = glm::inverse(cam.viewProj);
+        cam.view        = viewMat;
+        cam.proj        = projMat;
+        cam.viewProj    = viewProjMat;
+        cam.invViewProj = invViewProjMat;
         cam.lightViewProj = renderShadows
             ? computeLightViewProj(sunSample.directionToSun, mesh.aabbMin, mesh.aabbMax)
             : glm::mat4(1.0f);
@@ -2661,6 +3167,18 @@ int main(int argc, char** argv) {
     for (auto& b : cameraUbos) vmaDestroyBuffer(gpu.allocator, b.buffer, b.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
+    vkDestroyPipeline(gpu.device, skyViewPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, skyViewPipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, skyViewDescPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, skyViewSetLayout, nullptr);
+    vkDestroySampler(gpu.device, skyViewSampler, nullptr);
+    vkDestroyImageView(gpu.device, skyViewSampleView, nullptr);
+    vkDestroyImageView(gpu.device, skyViewStorageView, nullptr);
+    vmaDestroyImage(gpu.allocator, skyViewImage, skyViewAlloc);
+    vkDestroySampler(gpu.device, transSampler, nullptr);
+    vkDestroyImageView(gpu.device, transSampleView, nullptr);
+    vkDestroyImageView(gpu.device, transStorageView, nullptr);
+    vmaDestroyImage(gpu.allocator, transImage, transAlloc);
     vkDestroyCommandPool(gpu.device, sunHoursPool, nullptr);
     vkDestroyPipeline(gpu.device, sunHoursPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, sunHoursPipelineLayout, nullptr);
