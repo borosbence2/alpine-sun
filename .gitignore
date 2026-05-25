@@ -7,3 +7,6 @@ CMakeUserPresets.json
 
 # Downloaded test data (auto-fetched by CMake at configure time)
 assets/dem/
+
+# ImGui auto-saves panel layout next to the executable on shutdown.
+imgui.ini

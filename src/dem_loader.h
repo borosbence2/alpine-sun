@@ -36,4 +36,11 @@ struct Tile {
 // printed to stderr. On success, `out` is fully populated.
 bool loadGeoTIFF(const std::string& path, Tile& out);
 
+// Crops `tile` in place to the smallest pixel-aligned window that covers the
+// given lat/lon bounds. Adjusts width/height/extent/pixel-size and re-derives
+// min/max elevation. Bounds outside the tile are silently clamped. Returns
+// false (and leaves the tile unchanged) if the requested region doesn't
+// intersect the tile at all.
+bool cropTile(Tile& tile, double minLon, double maxLon, double minLat, double maxLat);
+
 } // namespace dem

@@ -3,6 +3,7 @@
 #include <tiffio.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <limits>
 #include <vector>
@@ -202,6 +203,76 @@ bool loadGeoTIFF(const std::string& path, Tile& out) {
     }
     out.minElevation = lo;
     out.maxElevation = hi;
+
+    return true;
+}
+
+bool cropTile(Tile& tile, double minLon, double maxLon, double minLat, double maxLat) {
+    // Clamp the requested window to the tile's extent, then derive pixel
+    // bounds. Row 0 sits at maxLat and grows southward, hence the y inversion.
+    const double clampedMinLon = std::max(minLon, tile.extent.minLon);
+    const double clampedMaxLon = std::min(maxLon, tile.extent.maxLon);
+    const double clampedMinLat = std::max(minLat, tile.extent.minLat);
+    const double clampedMaxLat = std::min(maxLat, tile.extent.maxLat);
+    if (clampedMaxLon <= clampedMinLon || clampedMaxLat <= clampedMinLat) {
+        std::fprintf(stderr,
+                     "dem::cropTile: requested region [%.4f..%.4f, %.4f..%.4f] "
+                     "doesn't intersect tile [%.4f..%.4f, %.4f..%.4f]\n",
+                     minLon, maxLon, minLat, maxLat,
+                     tile.extent.minLon, tile.extent.maxLon,
+                     tile.extent.minLat, tile.extent.maxLat);
+        return false;
+    }
+
+    // px = floor((lon - minLon) / pixelSizeLon)
+    // py = floor((maxLat - lat) / pixelSizeLat)
+    const int px0 = static_cast<int>(
+        std::floor((clampedMinLon - tile.extent.minLon) / tile.pixelSizeLon));
+    const int px1 = static_cast<int>(
+        std::ceil ((clampedMaxLon - tile.extent.minLon) / tile.pixelSizeLon));
+    // Row index grows southward, so the NORTH edge gives the smaller row.
+    const int py0 = static_cast<int>(
+        std::floor((tile.extent.maxLat - clampedMaxLat) / tile.pixelSizeLat));
+    const int py1 = static_cast<int>(
+        std::ceil ((tile.extent.maxLat - clampedMinLat) / tile.pixelSizeLat));
+
+    const int x0 = std::clamp(px0, 0, static_cast<int>(tile.width));
+    const int x1 = std::clamp(px1, 0, static_cast<int>(tile.width));
+    const int y0 = std::clamp(py0, 0, static_cast<int>(tile.height));
+    const int y1 = std::clamp(py1, 0, static_cast<int>(tile.height));
+    if (x1 <= x0 || y1 <= y0) return false;
+
+    const uint32_t newW = static_cast<uint32_t>(x1 - x0);
+    const uint32_t newH = static_cast<uint32_t>(y1 - y0);
+    std::vector<float> cropped;
+    cropped.reserve(static_cast<size_t>(newW) * newH);
+    for (int y = y0; y < y1; ++y) {
+        const size_t rowStart = static_cast<size_t>(y) * tile.width;
+        cropped.insert(cropped.end(),
+                       tile.elevation.begin() + rowStart + x0,
+                       tile.elevation.begin() + rowStart + x1);
+    }
+
+    // Update geo metadata to match the cropped window. Pixel size doesn't
+    // change (we just pick a sub-rectangle of the same grid).
+    tile.elevation     = std::move(cropped);
+    tile.width         = newW;
+    tile.height        = newH;
+    tile.extent.minLon = tile.extent.minLon + x0 * tile.pixelSizeLon;
+    tile.extent.maxLon = tile.extent.minLon + newW * tile.pixelSizeLon;
+    tile.extent.maxLat = tile.extent.maxLat - y0 * tile.pixelSizeLat;
+    tile.extent.minLat = tile.extent.maxLat - newH * tile.pixelSizeLat;
+
+    float lo = std::numeric_limits<float>::infinity();
+    float hi = -std::numeric_limits<float>::infinity();
+    for (float v : tile.elevation) {
+        if (v == v) {
+            lo = std::min(lo, v);
+            hi = std::max(hi, v);
+        }
+    }
+    tile.minElevation = lo;
+    tile.maxElevation = hi;
 
     return true;
 }

@@ -71,31 +71,41 @@ CPMAddPackage(
 )
 
 # ----------------------------------------------------------------------------
-# Test data: one Copernicus GLO-30 DEM tile covering Matterhorn.
-# 1° x 1° tile, SW corner 45°N 7°E => covers Matterhorn (45.976°N, 7.658°E).
-# AWS Open Data S3 bucket, ~30 MB, no authentication required.
+# Test data: Copernicus GLO-30 DEM tiles for the built-in preset regions.
+# Each tile is a 1° × 1° WGS84 GeoTIFF, ~30 MB, served by AWS Open Data with
+# no authentication. We download every tile any preset references; the app
+# picks one at runtime via --terrain and crops to the preset's window.
 # ----------------------------------------------------------------------------
-set(MATTERHORN_TILE_DIR  "${CMAKE_CURRENT_SOURCE_DIR}/assets/dem")
-set(MATTERHORN_TILE_NAME "Copernicus_DSM_COG_10_N45_00_E007_00_DEM.tif")
-set(MATTERHORN_TILE_PATH "${MATTERHORN_TILE_DIR}/${MATTERHORN_TILE_NAME}")
+set(DEM_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/dem")
+file(MAKE_DIRECTORY "${DEM_DIR}")
 
-if(NOT EXISTS "${MATTERHORN_TILE_PATH}")
-    file(MAKE_DIRECTORY "${MATTERHORN_TILE_DIR}")
-    message(STATUS "Downloading Copernicus GLO-30 Matterhorn tile (~30 MB)...")
-    file(DOWNLOAD
-        "https://copernicus-dem-30m.s3.amazonaws.com/Copernicus_DSM_COG_10_N45_00_E007_00_DEM/${MATTERHORN_TILE_NAME}"
-        "${MATTERHORN_TILE_PATH}"
-        SHOW_PROGRESS
-        STATUS MATTERHORN_DL_STATUS
-    )
-    list(GET MATTERHORN_DL_STATUS 0 MATTERHORN_DL_CODE)
-    if(NOT MATTERHORN_DL_CODE EQUAL 0)
-        list(GET MATTERHORN_DL_STATUS 1 MATTERHORN_DL_MESSAGE)
-        file(REMOVE "${MATTERHORN_TILE_PATH}")
-        message(FATAL_ERROR
-            "Failed to download Matterhorn tile: ${MATTERHORN_DL_MESSAGE}")
+function(alpine_sun_download_dem name)
+    set(_path "${DEM_DIR}/${name}")
+    if(NOT EXISTS "${_path}")
+        message(STATUS "Downloading Copernicus GLO-30 tile ${name} (~30 MB)...")
+        string(REPLACE ".tif" "" _stem "${name}")
+        file(DOWNLOAD
+            "https://copernicus-dem-30m.s3.amazonaws.com/${_stem}/${name}"
+            "${_path}"
+            SHOW_PROGRESS
+            STATUS _dl_status
+        )
+        list(GET _dl_status 0 _dl_code)
+        if(NOT _dl_code EQUAL 0)
+            list(GET _dl_status 1 _dl_msg)
+            file(REMOVE "${_path}")
+            message(FATAL_ERROR "Failed to download ${name}: ${_dl_msg}")
+        endif()
     endif()
-endif()
+endfunction()
+
+# Matterhorn — Pennine Alps. Used by matterhorn-wide and matterhorn presets.
+alpine_sun_download_dem("Copernicus_DSM_COG_10_N45_00_E007_00_DEM.tif")
+# Everest — Mahalangur Himal. Used by the everest preset.
+alpine_sun_download_dem("Copernicus_DSM_COG_10_N27_00_E086_00_DEM.tif")
+
+set(MATTERHORN_TILE_PATH "${DEM_DIR}/Copernicus_DSM_COG_10_N45_00_E007_00_DEM.tif")
+set(EVEREST_TILE_PATH    "${DEM_DIR}/Copernicus_DSM_COG_10_N27_00_E086_00_DEM.tif")
 
 # ----------------------------------------------------------------------------
 # alpine_sun executable
@@ -122,6 +132,7 @@ target_include_directories(alpine_sun PRIVATE
 
 target_compile_definitions(alpine_sun PRIVATE
     ALPINE_SUN_MATTERHORN_TILE_PATH="${MATTERHORN_TILE_PATH}"
+    ALPINE_SUN_EVEREST_TILE_PATH="${EVEREST_TILE_PATH}"
 )
 
 # Shaders — ForfunShaders.cmake's add_shader() is available transitively

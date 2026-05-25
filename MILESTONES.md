@@ -59,9 +59,10 @@ controls → final scene).
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
 | A1.terrain.1  | GeoTIFF loader (libtiff + zlib via CPM; tiled+scanline; uint32_t counts)   | DONE   |
-| A1.terrain.2  | Auto-download Copernicus GLO-30 Matterhorn tile (~30 MB from AWS Open Data) | DONE  |
+| A1.terrain.2  | Auto-download Copernicus GLO-30 tiles (CMake `file(DOWNLOAD)`, ~30 MB each from AWS Open Data). Multiple tiles for the built-in preset regions. | DONE |
 | A1.terrain.3  | Local ENU frame (centred on tile midpoint; metres-per-degree precomputed)  | DONE   |
 | A1.terrain.4  | Heightmap → triangle mesh (configurable stride; central-difference normals) | DONE  |
+| A1.terrain.4b | `dem::cropTile` clips a loaded GeoTIFF to a sub-region. Built-in `TerrainPreset` table (`matterhorn` close-up, `matterhorn-wide` full tile, `everest` close-up) selectable via `--terrain <name>`; each preset carries observer lat/lon, timezone and camera framing. Default is the close Matterhorn view. | DONE |
 
 ### Phase 1b — GPU plumbing (in progress)
 

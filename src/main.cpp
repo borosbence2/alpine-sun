@@ -8,6 +8,7 @@
 #include <GLFW/glfw3.h>
 
 #include "dem_loader.h"
+#include "geo_frame.h"
 #include "terrain_mesh.h"
 #include "sun_driver.h"
 #include "device.h"        // forfun::createDevice / destroyDevice
@@ -278,12 +279,73 @@ struct LoadedTerrain {
     dem::Tile     tile;   // kept around so we can upload the heightmap to the GPU
 };
 
-LoadedTerrain loadAndBuildTerrain() {
+// Built-in sample regions. Each entry names a Copernicus GLO-30 tile (downloaded
+// at configure time by CMake) and a lat/lon crop window within it. Mesh stride
+// is per-preset because cropped regions can afford finer mesh detail without
+// blowing up the vertex count.
+struct TerrainPreset {
+    const char* name;
+    const char* tilePath;       // path baked in by CMake
+    double      minLon, maxLon;
+    double      minLat, maxLat;
+    uint32_t    meshStride;     // stride=1 = full DEM detail, stride=8 = 1/64 verts
+    // Observer defaults: where the sun is computed from + local timezone.
+    // The camera also frames itself on this point at startup.
+    double      observerLat;
+    double      observerLon;
+    float       tzOffsetH;
+    float       camDistanceM;
+    const char* description;
+};
+
+const TerrainPreset kPresets[] = {
+    // ~9 km × 10 km centred on Matterhorn (45.976°N, 7.658°E). The peak sits
+    // close to the north edge of the source GLO-30 tile (N45), so we can't
+    // extend much further north without stitching another tile in. Full
+    // DEM detail; CEST is UTC+2 (DST in late May).
+    {"matterhorn", ALPINE_SUN_MATTERHORN_TILE_PATH,
+     7.60, 7.72, 45.91, 46.00, 1,
+     45.976, 7.658, 2.0f, 12000.0f,
+     "Matterhorn close-up (~9 km × 10 km) — full DEM detail"},
+    // The original wide preset: full 1° tile, stride=8 to keep the mesh tractable.
+    {"matterhorn-wide", ALPINE_SUN_MATTERHORN_TILE_PATH,
+     7.0, 8.0, 45.0, 46.0, 8,
+     45.976, 7.658, 2.0f, 30000.0f,
+     "Matterhorn region (1° × 1°, ~80 km × 110 km) — coarse mesh"},
+    // ~15 km × 10 km centred on Everest (27.988°N, 86.925°E). Includes Lhotse,
+    // Nuptse and the upper Khumbu icefall area. Same tile-edge constraint as
+    // Matterhorn: the summit is near the north edge of N27. Nepal Standard
+    // Time is UTC+5:45.
+    {"everest", ALPINE_SUN_EVEREST_TILE_PATH,
+     86.85, 87.00, 27.91, 28.00, 1,
+     27.988, 86.925, 5.75f, 14000.0f,
+     "Mt Everest close-up (~15 km × 10 km) — full DEM detail"},
+};
+constexpr int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
+
+const TerrainPreset& findPresetOrDie(const char* name) {
+    for (const auto& p : kPresets) {
+        if (std::strcmp(p.name, name) == 0) return p;
+    }
+    std::fprintf(stderr, "alpine-sun: unknown terrain preset '%s'. Available:\n", name);
+    for (const auto& p : kPresets) {
+        std::fprintf(stderr, "  %-16s %s\n", p.name, p.description);
+    }
+    std::exit(EXIT_FAILURE);
+}
+
+LoadedTerrain loadAndBuildTerrain(const TerrainPreset& preset) {
     LoadedTerrain result;
-    const char* path = ALPINE_SUN_MATTERHORN_TILE_PATH;
-    std::printf("dem: loading %s\n", path);
-    if (!dem::loadGeoTIFF(path, result.tile)) {
+    std::printf("preset: %s — %s\n", preset.name, preset.description);
+    std::printf("dem: loading %s\n", preset.tilePath);
+    if (!dem::loadGeoTIFF(preset.tilePath, result.tile)) {
         std::fprintf(stderr, "dem: load failed\n");
+        std::exit(EXIT_FAILURE);
+    }
+    if (!dem::cropTile(result.tile,
+                       preset.minLon, preset.maxLon,
+                       preset.minLat, preset.maxLat)) {
+        std::fprintf(stderr, "dem: crop failed\n");
         std::exit(EXIT_FAILURE);
     }
     const dem::Tile& tile = result.tile;
@@ -297,10 +359,8 @@ LoadedTerrain loadAndBuildTerrain() {
                 static_cast<double>(tile.minElevation),
                 static_cast<double>(tile.maxElevation));
 
-    // stride=8 keeps the MVP mesh light (~200k verts, ~400k tris) and quick
-    // to regenerate while iterating. Drop to stride=1 for full GLO-30 detail.
     terrain::MeshOptions opts;
-    opts.stride = 8;
+    opts.stride = preset.meshStride;
     result.mesh = terrain::makeMesh(result.tile, opts);
     const terrain::Mesh& mesh = result.mesh;
     std::printf("mesh: %zu verts, %zu tris, stride=%u\n",
@@ -316,10 +376,42 @@ LoadedTerrain loadAndBuildTerrain() {
 
 } // namespace
 
-int main() {
-    LoadedTerrain loaded = loadAndBuildTerrain();
+int main(int argc, char** argv) {
+    // CLI: --terrain <name>. Default to the close Matterhorn view.
+    const char* presetName = "matterhorn";
+    for (int i = 1; i < argc; ++i) {
+        if (std::strcmp(argv[i], "--terrain") == 0 && i + 1 < argc) {
+            presetName = argv[++i];
+        } else if (std::strcmp(argv[i], "--help") == 0
+                || std::strcmp(argv[i], "-h") == 0) {
+            std::printf("Usage: alpine_sun [--terrain <name>]\n\nPresets:\n");
+            for (const auto& p : kPresets) {
+                std::printf("  %-16s %s\n", p.name, p.description);
+            }
+            return EXIT_SUCCESS;
+        }
+    }
+    const TerrainPreset& preset = findPresetOrDie(presetName);
+
+    // Apply the preset's observer + camera defaults BEFORE loading so the
+    // first sun-hours bake uses the right location/timezone.
+    g_sun.latDeg    = static_cast<float>(preset.observerLat);
+    g_sun.lonDeg    = static_cast<float>(preset.observerLon);
+    g_sun.tzOffsetH = preset.tzOffsetH;
+
+    LoadedTerrain loaded = loadAndBuildTerrain(preset);
     const terrain::Mesh& mesh = loaded.mesh;
     const dem::Tile&     tile = loaded.tile;
+
+    // Frame the camera on the observer point at preset-defined distance. The
+    // observer's (lat, lon) maps to (east, north) via the mesh's ENU frame;
+    // we lift z to the AABB top so the target sits roughly on the peak.
+    g_camera.target = glm::vec3(
+        static_cast<float>(geo::lonToEast (mesh.frame, preset.observerLon)),
+        static_cast<float>(geo::latToNorth(mesh.frame, preset.observerLat)),
+        mesh.aabbMax.z);
+    g_camera.distance = preset.camDistanceM;
+    g_camera.maxDistance = std::max(g_camera.maxDistance, preset.camDistanceM * 4.0f);
 
     if (!glfwInit()) {
         std::fprintf(stderr, "glfwInit failed\n");
