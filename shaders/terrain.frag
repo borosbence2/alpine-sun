@@ -18,6 +18,7 @@ layout(set = 0, binding = 1) uniform sampler2D      uShadowMap;
 layout(set = 0, binding = 2) uniform sampler2DArray uHorizonMap;
 layout(set = 0, binding = 3) uniform sampler2D      uSunHours;
 layout(set = 0, binding = 4) uniform sampler2D      uSatellite;
+layout(set = 0, binding = 5) uniform sampler2D      uSkyView;
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in float vHeight;
@@ -35,6 +36,21 @@ vec3 acesFilm(vec3 c) {
     return clamp((c * (2.51 * c + 0.03)) /
                  (c * (2.43 * c + 0.59) + 0.14),
                  0.0, 1.0);
+}
+
+// Sky-view LUT lookup matching the parameterisation used by sky_view.comp.
+// Direction is expected in ENU (+Z = up). Used here to drive ambient
+// lighting: shaded faces pick up the colour of the sky they "see" along
+// their surface normal — blue daytime, warm at sunset, near-black at night.
+vec3 sampleSky(vec3 dir) {
+    float lat = asin(clamp(dir.z, -1.0, 1.0));
+    float az  = atan(dir.x, dir.y);
+    if (az < 0.0) az += TWO_PI;
+    float latNorm = clamp(lat / HALF_PI, -1.0, 1.0);
+    float vc = sign(latNorm) * sqrt(abs(latNorm));
+    float u  = az / TWO_PI;
+    float v  = vc * 0.5 + 0.5;
+    return texture(uSkyView, vec2(u, v)).rgb;
 }
 
 float sampleShadow(vec4 lightClip) {
@@ -160,9 +176,17 @@ void main() {
                    : 1.0;
     float visibility = min(vShadow, vHorizon);
 
-    float direct  = ndotl * aboveHorizon * visibility;
-    float ambient = mix(0.05, 0.20, aboveHorizon);
+    float direct = ndotl * aboveHorizon * visibility;
 
-    vec3 linearColor = albedo * (ambient + 0.75 * direct);
+    // Sky-tinted ambient: sample the Hillaire sky-view LUT in the direction
+    // of the surface normal (clamped to the upper hemisphere so overhangs
+    // still pick up some sky). The 0.06 scale brings the LUT's HDR units
+    // into roughly the same magnitude as the old [0.05..0.20] flat ambient;
+    // a small constant floor keeps shaded areas from going jet-black on
+    // moonless nights.
+    vec3 ambientDir = normalize(vec3(N.x, N.y, max(N.z, 0.1)));
+    vec3 ambient = sampleSky(ambientDir) * 0.06 + vec3(0.012);
+
+    vec3 linearColor = albedo * (ambient + vec3(0.75 * direct));
     outColor = vec4(acesFilm(linearColor * cam.toneParams.x), 1.0);
 }

@@ -173,6 +173,12 @@ proper Rayleigh blue, warm reddening near the horizon at low sun, and a
 deep cool sky at night — without any of the ad-hoc gradient math the
 previous procedural sky used.
 
+The terrain `frag` shader also samples the sky-view LUT — in the direction
+of each fragment's surface normal — as the **ambient** term. Shaded north
+faces pick up cool blue from the zenith at noon; at sunset, faces oriented
+toward the sun pick up warm orange. A tiny constant floor keeps shaded
+areas readable on moonless nights.
+
 Both sky and terrain pass through the same ACES (Narkowicz fit) tonemap
 with a user-controlled exposure.
 
