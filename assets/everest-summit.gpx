@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="alpine-sun sample"
+     xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Everest South-Col route — Camp 2 to Summit</name>
+    <desc>Approximate line: Camp 2 in the Western Cwm → up the Lhotse face
+      → South Col (Camp 4) → Balcony → SE ridge → South Summit → Everest
+      summit. Coordinates traced from public knowledge of the major landmarks
+      (Camp 2 at the east end of the Western Cwm near 86.88°E; South Col at
+      27.973°N, 86.929°E; summit at 27.988°N, 86.925°E). ~100–200 m
+      accuracy — visualisation only, not navigation.</desc>
+    <trkseg>
+      <trkpt lat="27.9970" lon="86.8950"><ele>6400</ele></trkpt>  <!-- Camp 2 (Western Cwm, east end) -->
+      <trkpt lat="27.9905" lon="86.9100"><ele>6750</ele></trkpt>  <!-- Bergschrund / Lhotse face base -->
+      <trkpt lat="27.9840" lon="86.9180"><ele>7100</ele></trkpt>  <!-- Lower Lhotse face -->
+      <trkpt lat="27.9800" lon="86.9230"><ele>7450</ele></trkpt>  <!-- Mid Lhotse face -->
+      <trkpt lat="27.9760" lon="86.9260"><ele>7700</ele></trkpt>  <!-- Yellow Band / Geneva Spur -->
+      <trkpt lat="27.9735" lon="86.9290"><ele>7906</ele></trkpt>  <!-- South Col / Camp 4 -->
+      <trkpt lat="27.9800" lon="86.9270"><ele>8350</ele></trkpt>  <!-- Balcony -->
+      <trkpt lat="27.9840" lon="86.9258"><ele>8500</ele></trkpt>  <!-- SE ridge -->
+      <trkpt lat="27.9870" lon="86.9252"><ele>8748</ele></trkpt>  <!-- South Summit -->
+      <trkpt lat="27.9881" lon="86.9250"><ele>8849</ele></trkpt>  <!-- Everest Summit -->
+    </trkseg>
+  </trk>
+</gpx>

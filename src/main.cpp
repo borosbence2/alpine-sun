@@ -11,6 +11,7 @@
 #include "geo_frame.h"
 #include "terrain_mesh.h"
 #include "sun_driver.h"
+#include "gpx.h"
 #include "device.h"        // forfun::createDevice / destroyDevice
 #include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
 #include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
@@ -30,15 +31,20 @@
 #include "sun_hours.comp.h"
 #include "sky.vert.h"
 #include "sky.frag.h"
+#include "route.vert.h"
+#include "route.frag.h"
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <string>
+#include <vector>
 
 namespace {
 
@@ -113,6 +119,26 @@ struct ToneUi {
     float exposure = 1.0f;
 };
 
+// Loaded GPX route. CPU keeps waypoints + ENU vertices around so we can build
+// the waypoint sun-hours table; GPU holds a tightly-packed vertex buffer for
+// the line-strip draw. Lifted a few metres above the sampled DEM height so
+// the line floats above terrain instead of z-fighting it.
+constexpr float kRouteLiftMetres = 15.0f;
+struct Route {
+    std::string                file;        // source path (for the UI status line)
+    std::vector<gpx::Waypoint> waypoints;   // raw parser output (lat/lon/ele)
+    std::vector<glm::vec3>     enu;         // world-space positions, post-lift
+    std::vector<float>         sunHours;    // per-waypoint sun-hours/day (filled after bake)
+    Buffer                     vb;
+    uint32_t                   vertexCount = 0;
+    bool                       visible     = true;
+    float                      lengthKm    = 0.0f;
+};
+
+struct PendingGpxLoad {
+    std::string path;
+};
+
 // Right-click picking. Cleared once the readback completes.
 struct PickRequest {
     bool pending = false;
@@ -167,8 +193,10 @@ SunUi       g_sun;
 ShadowUi    g_shadow;
 SunHoursUi  g_sunHours;
 ToneUi      g_tone;
-PickRequest g_pickRequest;
-PickResult  g_pickResult;
+PickRequest    g_pickRequest;
+PickResult     g_pickResult;
+PendingGpxLoad g_pendingGpx;     // populated by the GLFW drop callback; consumed at top of loop
+Route          g_route;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -234,6 +262,70 @@ glm::mat4 computeLightViewProj(const glm::vec3& sunDir,
     return lightProj * lightView;
 }
 
+// Bilinear sample of the DEM at a given lat/lon. Used to drape GPX waypoints
+// onto the terrain so the rendered polyline tracks the surface even when a
+// GPX file omits <ele> or has stale elevations. Out-of-tile inputs clamp to
+// the nearest edge.
+float sampleDemBilinear(const dem::Tile& tile, double lon, double lat) {
+    if (tile.width < 2 || tile.height < 2) return 0.0f;
+    double px = (lon - tile.extent.minLon) / tile.pixelSizeLon;
+    double py = (tile.extent.maxLat - lat ) / tile.pixelSizeLat;   // N→S
+    px = std::clamp(px, 0.0, double(tile.width  - 1));
+    py = std::clamp(py, 0.0, double(tile.height - 1));
+    const int x0 = static_cast<int>(std::floor(px));
+    const int y0 = static_cast<int>(std::floor(py));
+    const int x1 = std::min(x0 + 1, int(tile.width  - 1));
+    const int y1 = std::min(y0 + 1, int(tile.height - 1));
+    const float fx = static_cast<float>(px - x0);
+    const float fy = static_cast<float>(py - y0);
+    const float v00 = tile.elevation[size_t(y0) * tile.width + x0];
+    const float v10 = tile.elevation[size_t(y0) * tile.width + x1];
+    const float v01 = tile.elevation[size_t(y1) * tile.width + x0];
+    const float v11 = tile.elevation[size_t(y1) * tile.width + x1];
+    return (1.0f - fy) * ((1.0f - fx) * v00 + fx * v10)
+         +         fy  * ((1.0f - fx) * v01 + fx * v11);
+}
+
+// Populates `route.sunHours` by looking up each waypoint's world-XY in the
+// CPU-side sun-hours grid. Cheap — one nearest-neighbour read per waypoint.
+void updateRouteSunHoursFromReadback(Route& route,
+                                     const float* sunHoursData,
+                                     int sunHoursSize,
+                                     const glm::vec3& aabbMin,
+                                     const glm::vec3& aabbMax) {
+    if (route.vertexCount == 0) {
+        route.sunHours.clear();
+        return;
+    }
+    const glm::vec2 extent(aabbMax.x - aabbMin.x, aabbMax.y - aabbMin.y);
+    route.sunHours.resize(route.vertexCount);
+    for (uint32_t i = 0; i < route.vertexCount; ++i) {
+        const glm::vec3& p = route.enu[i];
+        const float u = (p.x - aabbMin.x) / extent.x;
+        const float v = (aabbMax.y - p.y) / extent.y;       // N→S
+        const int x = std::clamp(int(u * sunHoursSize), 0, sunHoursSize - 1);
+        const int y = std::clamp(int(v * sunHoursSize), 0, sunHoursSize - 1);
+        route.sunHours[i] = sunHoursData[y * sunHoursSize + x];
+    }
+}
+
+// GLFW drop callback — runs on the main thread during glfwPollEvents. We
+// can't do GPU work here (no access to mesh/gpu) so we just record the path;
+// the per-frame loop consumes it before recording commands.
+void dropCallback(GLFWwindow*, int count, const char** paths) {
+    for (int i = 0; i < count; ++i) {
+        std::string p = paths[i];
+        if (p.size() < 4) continue;
+        std::string ext = p.substr(p.size() - 4);
+        std::transform(ext.begin(), ext.end(), ext.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        if (ext == ".gpx") {
+            g_pendingGpx.path = std::move(p);
+            return;
+        }
+    }
+}
+
 // Matt Zucker's polynomial viridis fit — same coefficients as the GLSL copy
 // in terrain.frag so the ImGui legend matches the on-terrain colours exactly.
 glm::vec3 viridisCpu(float t) {
@@ -295,6 +387,9 @@ struct TerrainPreset {
     double      observerLon;
     float       tzOffsetH;
     float       camDistanceM;
+    // Optional GPX route auto-loaded with the preset. Toggleable in the UI
+    // via the standard "Show on terrain" checkbox; nullptr means no built-in.
+    const char* builtInGpxPath;
     const char* description;
 };
 
@@ -302,23 +397,28 @@ const TerrainPreset kPresets[] = {
     // ~9 km × 10 km centred on Matterhorn (45.976°N, 7.658°E). The peak sits
     // close to the north edge of the source GLO-30 tile (N45), so we can't
     // extend much further north without stitching another tile in. Full
-    // DEM detail; CEST is UTC+2 (DST in late May).
+    // DEM detail; CEST is UTC+2 (DST in late May). Auto-loads the Hörnli
+    // ridge route (hut → summit) as a built-in.
     {"matterhorn", ALPINE_SUN_MATTERHORN_TILE_PATH,
      7.60, 7.72, 45.91, 46.00, 1,
      45.976, 7.658, 2.0f, 12000.0f,
+     ALPINE_SUN_ROUTE_MATTERHORN_HORNLI,
      "Matterhorn close-up (~9 km × 10 km) — full DEM detail"},
     // The original wide preset: full 1° tile, stride=8 to keep the mesh tractable.
     {"matterhorn-wide", ALPINE_SUN_MATTERHORN_TILE_PATH,
      7.0, 8.0, 45.0, 46.0, 8,
      45.976, 7.658, 2.0f, 30000.0f,
+     nullptr,
      "Matterhorn region (1° × 1°, ~80 km × 110 km) — coarse mesh"},
     // ~15 km × 10 km centred on Everest (27.988°N, 86.925°E). Includes Lhotse,
     // Nuptse and the upper Khumbu icefall area. Same tile-edge constraint as
     // Matterhorn: the summit is near the north edge of N27. Nepal Standard
-    // Time is UTC+5:45.
+    // Time is UTC+5:45. Auto-loads the South-Col summit route (Camp 2 →
+    // Lhotse face → South Col → summit) as a built-in.
     {"everest", ALPINE_SUN_EVEREST_TILE_PATH,
      86.85, 87.00, 27.91, 28.00, 1,
      27.988, 86.925, 5.75f, 14000.0f,
+     ALPINE_SUN_ROUTE_EVEREST_SUMMIT,
      "Mt Everest close-up (~15 km × 10 km) — full DEM detail"},
 };
 constexpr int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
@@ -454,8 +554,11 @@ int main(int argc, char** argv) {
                 kFramesInFlight);
 
     // ---- Depth attachment ----
+    // TRANSFER_SRC so the picking path can copy a single texel back to a
+    // host buffer at the end of the frame.
     DepthImage depth = createDepthImage(gpu.allocator, gpu.device, sc.extent,
-                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT);
+                                        VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
+                                      | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 
     // ---- Sun-POV shadow map (depth-only, also sampled by terrain frag) ----
     DepthImage shadowMap = createDepthImage(
@@ -857,7 +960,11 @@ int main(int argc, char** argv) {
         imageCi.arrayLayers   = 1;
         imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
         imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        // TRANSFER_SRC so we can copy back to host every bake (waypoint table)
+        // and copy single texels for right-click sampling.
+        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT
+                              | VK_IMAGE_USAGE_SAMPLED_BIT
+                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         VmaAllocationCreateInfo allocCi{};
         allocCi.usage = VMA_MEMORY_USAGE_AUTO;
@@ -893,6 +1000,14 @@ int main(int argc, char** argv) {
         gpu.allocator, sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     Buffer pickHoursBuf = createBufferHostMapped(
         gpu.allocator, sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+
+    // ---- Sun-hours full-texture readback (for waypoint table) ----
+    // 1 MB copy after every bake — populates a CPU-resident grid we can query
+    // at any (worldX, worldY) without round-tripping through Vulkan again.
+    const VkDeviceSize kSunHoursReadbackBytes =
+        static_cast<VkDeviceSize>(kSunHoursMapSize) * kSunHoursMapSize * sizeof(float);
+    Buffer sunHoursReadback = createBufferHostMapped(
+        gpu.allocator, kSunHoursReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
     // ---- Sun-hours compute pipeline (persistent — re-dispatched on date change) ----
     VkDescriptorSetLayout sunHoursSetLayout = VK_NULL_HANDLE;
@@ -1055,10 +1170,29 @@ int main(int argc, char** argv) {
         const uint32_t groupsY = (kSunHoursMapSize + 7) / 8;
         vkCmdDispatch(cmd, groupsX, groupsY, 1);
 
+        // Copy the just-baked accumulator to a host-visible buffer so the
+        // route waypoint table can look up sun-hours per point without
+        // round-tripping the GPU again. We go through TRANSFER_SRC because
+        // imageStore writes need to be flushed before COPY can read them.
         transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                         VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
                         VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_COPY_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT);
+
+        VkBufferImageCopy rbRegion{};
+        rbRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        rbRegion.imageSubresource.layerCount = 1;
+        rbRegion.imageExtent = {kSunHoursMapSize, kSunHoursMapSize, 1};
+        vkCmdCopyImageToBuffer(cmd, sunHoursImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                               sunHoursReadback.buffer, 1, &rbRegion);
+
+        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COPY_BIT,
+                        VK_ACCESS_2_TRANSFER_READ_BIT,
                         VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
                         VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
 
@@ -1080,6 +1214,15 @@ int main(int argc, char** argv) {
         lastBakedParams.initialized = true;
         std::printf("gpu: sun-hours baked — %d samples × %.1f h step\n",
                     n, static_cast<double>(samples->hoursPerStep));
+
+        // Pull the freshly-baked accumulator into our route waypoint cache.
+        // Safe to read now — the queue wait above guarantees the copy has
+        // landed in sunHoursReadback.mapped.
+        updateRouteSunHoursFromReadback(
+            g_route,
+            static_cast<const float*>(sunHoursReadback.mapped),
+            int(kSunHoursMapSize),
+            mesh.aabbMin, mesh.aabbMax);
     };
 
     // Initial bake so the descriptor binding is always backed by valid data.
@@ -1449,6 +1592,178 @@ int main(int argc, char** argv) {
     }
     std::printf("gpu: sky pipeline ready\n");
 
+    // ---- Route pipeline (line strip over the terrain) ----
+    // Shares the camera descriptor set layout (uses only binding 0). Single
+    // vec3 vertex attribute, depth-tested so points behind ridges hide
+    // correctly, no culling (lines have no front/back).
+    VkPipeline       routePipeline       = VK_NULL_HANDLE;
+    VkPipelineLayout routePipelineLayout = VK_NULL_HANDLE;
+    {
+        VkShaderModule rVertMod = createShaderModule(gpu.device,
+            route_vert_spv, sizeof(route_vert_spv));
+        VkShaderModule rFragMod = createShaderModule(gpu.device,
+            route_frag_spv, sizeof(route_frag_spv));
+
+        VkPipelineLayoutCreateInfo routePlCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        routePlCi.setLayoutCount = 1;
+        routePlCi.pSetLayouts    = &cameraSetLayout;
+        VK_CHECK(vkCreatePipelineLayout(gpu.device, &routePlCi, nullptr, &routePipelineLayout));
+
+        VkPipelineShaderStageCreateInfo rStages[2]{
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+            {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+        };
+        rStages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+        rStages[0].module = rVertMod;
+        rStages[0].pName  = "main";
+        rStages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+        rStages[1].module = rFragMod;
+        rStages[1].pName  = "main";
+
+        VkVertexInputBindingDescription rvbBinding{};
+        rvbBinding.binding   = 0;
+        rvbBinding.stride    = sizeof(glm::vec3);
+        rvbBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        VkVertexInputAttributeDescription rvbAttr{};
+        rvbAttr.location = 0;
+        rvbAttr.binding  = 0;
+        rvbAttr.format   = VK_FORMAT_R32G32B32_SFLOAT;
+        rvbAttr.offset   = 0;
+
+        VkPipelineVertexInputStateCreateInfo rVi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+        rVi.vertexBindingDescriptionCount   = 1;
+        rVi.pVertexBindingDescriptions      = &rvbBinding;
+        rVi.vertexAttributeDescriptionCount = 1;
+        rVi.pVertexAttributeDescriptions    = &rvbAttr;
+
+        VkPipelineInputAssemblyStateCreateInfo rIa{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+        rIa.topology = VK_PRIMITIVE_TOPOLOGY_LINE_STRIP;
+
+        VkPipelineViewportStateCreateInfo rVp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+        rVp.viewportCount = 1;
+        rVp.scissorCount  = 1;
+
+        VkPipelineRasterizationStateCreateInfo rRs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+        rRs.polygonMode = VK_POLYGON_MODE_FILL;
+        rRs.cullMode    = VK_CULL_MODE_NONE;
+        rRs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+        rRs.lineWidth   = 1.0f;  // overridden by dynamic state below
+
+        VkPipelineMultisampleStateCreateInfo rMs{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+        rMs.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+        VkPipelineDepthStencilStateCreateInfo rDs{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+        rDs.depthTestEnable  = VK_TRUE;
+        rDs.depthWriteEnable = VK_TRUE;
+        rDs.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+        VkPipelineColorBlendAttachmentState rCba{};
+        rCba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                            | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+        VkPipelineColorBlendStateCreateInfo rCb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+        rCb.attachmentCount = 1;
+        rCb.pAttachments    = &rCba;
+
+        VkDynamicState rDynStates[3] = {
+            VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR, VK_DYNAMIC_STATE_LINE_WIDTH,
+        };
+        VkPipelineDynamicStateCreateInfo rDyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+        rDyn.dynamicStateCount = 3;
+        rDyn.pDynamicStates    = rDynStates;
+
+        VkPipelineRenderingCreateInfo rPrCi{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+        rPrCi.colorAttachmentCount    = 1;
+        rPrCi.pColorAttachmentFormats = &sc.imageFormat;
+        rPrCi.depthAttachmentFormat   = kDepthFormat;
+
+        VkGraphicsPipelineCreateInfo rGpCi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+        rGpCi.pNext               = &rPrCi;
+        rGpCi.stageCount          = 2;
+        rGpCi.pStages             = rStages;
+        rGpCi.pVertexInputState   = &rVi;
+        rGpCi.pInputAssemblyState = &rIa;
+        rGpCi.pViewportState      = &rVp;
+        rGpCi.pRasterizationState = &rRs;
+        rGpCi.pMultisampleState   = &rMs;
+        rGpCi.pDepthStencilState  = &rDs;
+        rGpCi.pColorBlendState    = &rCb;
+        rGpCi.pDynamicState       = &rDyn;
+        rGpCi.layout              = routePipelineLayout;
+        VK_CHECK(vkCreateGraphicsPipelines(gpu.device, VK_NULL_HANDLE, 1, &rGpCi, nullptr, &routePipeline));
+
+        vkDestroyShaderModule(gpu.device, rFragMod, nullptr);
+        vkDestroyShaderModule(gpu.device, rVertMod, nullptr);
+    }
+    std::printf("gpu: route pipeline ready\n");
+
+    // ---- Route loader lambda ----
+    // Parses GPX → ENU world coords (DEM-sampled heights, lifted), uploads to
+    // a freshly-sized host-mapped VB. Cheap enough to run synchronously on
+    // each drop event.
+    auto loadRoute = [&](const std::string& path) {
+        std::vector<gpx::Waypoint> wps;
+        if (!gpx::loadFile(path, wps) || wps.empty()) {
+            std::fprintf(stderr, "route: failed to read or parse %s\n", path.c_str());
+            return;
+        }
+
+        std::vector<glm::vec3> enu;
+        enu.reserve(wps.size());
+        float lengthM = 0.0f;
+        for (size_t i = 0; i < wps.size(); ++i) {
+            const auto& wp = wps[i];
+            const float east  = static_cast<float>(geo::lonToEast (mesh.frame, wp.lon));
+            const float north = static_cast<float>(geo::latToNorth(mesh.frame, wp.lat));
+            // Always sample the DEM rather than trusting GPX <ele>: it keeps
+            // the rendered line glued to *our* surface even if the GPX has
+            // stale or barometric elevations.
+            const float demH = sampleDemBilinear(tile, wp.lon, wp.lat);
+            const glm::vec3 p(east, north, demH + kRouteLiftMetres);
+            enu.push_back(p);
+            if (i > 0) lengthM += glm::length(enu[i] - enu[i - 1]);
+        }
+
+        // Synchronise before destroying the old VB — any in-flight frame may
+        // still be drawing from it.
+        VK_CHECK(vkDeviceWaitIdle(gpu.device));
+        if (g_route.vb.buffer != VK_NULL_HANDLE) {
+            vmaDestroyBuffer(gpu.allocator, g_route.vb.buffer, g_route.vb.allocation);
+            g_route.vb = {};
+        }
+        const VkDeviceSize sz = sizeof(glm::vec3) * enu.size();
+        g_route.vb = createBufferHostMapped(gpu.allocator, sz, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
+        std::memcpy(g_route.vb.mapped, enu.data(), static_cast<size_t>(sz));
+
+        g_route.file        = path;
+        g_route.waypoints   = std::move(wps);
+        g_route.enu         = std::move(enu);
+        g_route.vertexCount = static_cast<uint32_t>(g_route.enu.size());
+        g_route.lengthKm    = lengthM * 0.001f;
+        g_route.visible     = true;
+
+        // Sun-hours per waypoint comes from the latest readback. We may not
+        // have ever baked when --terrain switches and the user immediately
+        // drops a GPX, but sunHoursReadback is filled by the initial bake at
+        // startup so this is always valid.
+        updateRouteSunHoursFromReadback(
+            g_route,
+            static_cast<const float*>(sunHoursReadback.mapped),
+            int(kSunHoursMapSize),
+            mesh.aabbMin, mesh.aabbMax);
+
+        std::printf("route: loaded %u waypoints, %.2f km from %s\n",
+                    g_route.vertexCount, double(g_route.lengthKm), path.c_str());
+    };
+
+    glfwSetDropCallback(window, dropCallback);
+
+    // Auto-load the preset's bundled route, if any. The user can still drop a
+    // .gpx to replace it; the visibility checkbox toggles whatever's loaded.
+    if (preset.builtInGpxPath != nullptr) {
+        loadRoute(preset.builtInGpxPath);
+    }
+
     // ---- ImGui setup ----
     // Generous pool — ImGui allocates one descriptor per font/texture and a
     // few more for its internals; helmet_demo's example uses 1000-of-each
@@ -1540,6 +1855,12 @@ int main(int argc, char** argv) {
         glfwPollEvents();
         if (glfwGetKey(window, GLFW_KEY_ESCAPE) == GLFW_PRESS) {
             glfwSetWindowShouldClose(window, GLFW_TRUE);
+        }
+
+        // Drop callback may have queued a GPX file during glfwPollEvents.
+        if (!g_pendingGpx.path.empty()) {
+            loadRoute(g_pendingGpx.path);
+            g_pendingGpx.path.clear();
         }
 
         // ---- Input → orbit camera ----
@@ -1690,6 +2011,44 @@ int main(int argc, char** argv) {
                 ImGui::Text("Sun  %5.2f h/day", g_pickResult.sunHours);
             } else {
                 ImGui::TextDisabled("(no sample yet)");
+            }
+
+            ImGui::Separator();
+            ImGui::TextUnformatted("Route");
+            if (g_route.vertexCount > 0) {
+                ImGui::Text("%u waypoints — %.2f km", g_route.vertexCount, double(g_route.lengthKm));
+                ImGui::Checkbox("Show on terrain", &g_route.visible);
+                // Compact table — scrolls if longer than the visible area.
+                if (ImGui::CollapsingHeader("Waypoints + sun")) {
+                    if (ImGui::BeginTable("waypoints", 5,
+                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg
+                          | ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingFixedFit,
+                            ImVec2(0.0f, 240.0f))) {
+                        ImGui::TableSetupScrollFreeze(0, 1);
+                        ImGui::TableSetupColumn("#",        ImGuiTableColumnFlags_WidthFixed, 30.0f);
+                        ImGui::TableSetupColumn("Lat",      ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                        ImGui::TableSetupColumn("Lon",      ImGuiTableColumnFlags_WidthFixed, 65.0f);
+                        ImGui::TableSetupColumn("Elev (m)", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+                        ImGui::TableSetupColumn("Sun h",    ImGuiTableColumnFlags_WidthFixed, 50.0f);
+                        ImGui::TableHeadersRow();
+                        for (uint32_t i = 0; i < g_route.vertexCount; ++i) {
+                            ImGui::TableNextRow();
+                            ImGui::TableSetColumnIndex(0); ImGui::Text("%u", i);
+                            ImGui::TableSetColumnIndex(1); ImGui::Text("%7.4f", g_route.waypoints[i].lat);
+                            ImGui::TableSetColumnIndex(2); ImGui::Text("%7.4f", g_route.waypoints[i].lon);
+                            ImGui::TableSetColumnIndex(3); ImGui::Text("%4.0f", g_route.enu[i].z - kRouteLiftMetres);
+                            ImGui::TableSetColumnIndex(4);
+                            if (i < g_route.sunHours.size()) {
+                                ImGui::Text("%4.1f", double(g_route.sunHours[i]));
+                            } else {
+                                ImGui::TextUnformatted("--");
+                            }
+                        }
+                        ImGui::EndTable();
+                    }
+                }
+            } else {
+                ImGui::TextDisabled("Drop a .gpx file on the window to load.");
             }
         }
         ImGui::End();
@@ -1877,6 +2236,24 @@ int main(int argc, char** argv) {
         vkCmdBindVertexBuffers(frame.cmd, 0, 1, &terrainVB.buffer, &vbOffset);
         vkCmdBindIndexBuffer  (frame.cmd, terrainIB.buffer, 0, VK_INDEX_TYPE_UINT32);
         vkCmdDrawIndexed      (frame.cmd, static_cast<uint32_t>(mesh.indices.size()), 1, 0, 0, 0);
+
+        // ---- Route line strip ----
+        // Drawn after terrain so cast-shadow / occlusion-by-terrain reads
+        // correctly via the shared depth buffer. Skipped when no route loaded
+        // or the user toggled it off.
+        if (g_route.vertexCount > 1 && g_route.visible) {
+            vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, routePipeline);
+            vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                    routePipelineLayout, 0, 1,
+                                    &cameraDescSets[frameIndex], 0, nullptr);
+            // wideLines feature isn't enabled in forfun's device — width must
+            // stay at 1.0 or validation complains. Magenta against terrain is
+            // visible even at one pixel.
+            vkCmdSetLineWidth(frame.cmd, 1.0f);
+            VkDeviceSize rOffset = 0;
+            vkCmdBindVertexBuffers(frame.cmd, 0, 1, &g_route.vb.buffer, &rOffset);
+            vkCmdDraw(frame.cmd, g_route.vertexCount, 1, 0, 0);
+        }
 
         // ImGui draws into the same swapchain attachment; we let it run
         // without depth so panels stay on top regardless of the terrain.
@@ -2066,6 +2443,11 @@ int main(int argc, char** argv) {
     ImGui::DestroyContext();
     vkDestroyDescriptorPool(gpu.device, imguiDescPool, nullptr);
 
+    if (g_route.vb.buffer != VK_NULL_HANDLE) {
+        vmaDestroyBuffer(gpu.allocator, g_route.vb.buffer, g_route.vb.allocation);
+    }
+    vkDestroyPipeline(gpu.device, routePipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, routePipelineLayout, nullptr);
     vkDestroyPipeline(gpu.device, skyPipeline, nullptr);
     vkDestroyPipelineLayout(gpu.device, skyPipelineLayout, nullptr);
     vkDestroyPipeline(gpu.device, shadowPipeline, nullptr);
@@ -2082,6 +2464,7 @@ int main(int argc, char** argv) {
     vkDestroyPipelineLayout(gpu.device, sunHoursPipelineLayout, nullptr);
     vkDestroyDescriptorPool(gpu.device, sunHoursDescPool, nullptr);
     vkDestroyDescriptorSetLayout(gpu.device, sunHoursSetLayout, nullptr);
+    vmaDestroyBuffer(gpu.allocator, sunHoursReadback.buffer, sunHoursReadback.allocation);
     vmaDestroyBuffer(gpu.allocator, pickHoursBuf.buffer, pickHoursBuf.allocation);
     vmaDestroyBuffer(gpu.allocator, pickDepthBuf.buffer, pickDepthBuf.allocation);
     vmaDestroyBuffer(gpu.allocator, sunSamplesBuf.buffer, sunSamplesBuf.allocation);

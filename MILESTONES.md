@@ -119,8 +119,8 @@ positioning via NREL SPA) is the next substantive milestone.
 
 | ID         | Description                                                                  | Status |
 |------------|------------------------------------------------------------------------------|--------|
-| A5.use.1   | GPX import → polyline rendered on terrain                                    | TODO   |
-| A5.use.2   | Per-waypoint sun query → "this pitch in shade until 10:30" table             | TODO   |
+| A5.use.1   | Hand-rolled GPX parser at `src/gpx.{h,cpp}` reads `<trkpt>`/`<rtept>` lat/lon/ele. Drop a `.gpx` on the window (GLFW `setDropCallback`) → ENU conversion + DEM-bilinear-sampled heights + small lift → host-mapped VB → drawn as a line-strip pipeline (binding 0 = camera UBO, depth-tested). Each terrain preset can carry a built-in GPX (`builtInGpxPath`) that auto-loads at startup: `matterhorn-hornli.gpx` (Hörnli ridge) and `everest-summit.gpx` (Camp 2 → Lhotse face → South Col → SE ridge → summit). | DONE |
+| A5.use.2   | After every sun-hours bake we copy the full 512² accumulator into a host buffer; per-waypoint lookups are nearest-neighbour CPU reads. ImGui collapsing "Waypoints + sun" table shows index, lat, lon, elevation, sun-hours/day. | DONE |
 | A5.use.3   | Satellite imagery overlay (Sentinel-2 or Mapbox raster tiles)                | TODO   |
 | A5.use.4   | Atmospheric scattering for alpenglow accuracy (Hillaire sky model)           | TODO   |
 | A5.use.5   | Save/load trip plans (JSON: location + route + date)                         | TODO   |

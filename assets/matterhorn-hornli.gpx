@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="alpine-sun sample"
+     xmlns="http://www.topografix.com/GPX/1/1">
+  <trk>
+    <name>Hornli Ridge approximation</name>
+    <desc>Hornli Hut to Matterhorn summit (~3 km horizontal, ~1200 m gain).
+      Hand-traced for demo purposes; not climbing-grade accuracy.</desc>
+    <trkseg>
+      <trkpt lat="45.97935" lon="7.66457"><ele>3260</ele></trkpt>
+      <trkpt lat="45.97862" lon="7.66301"><ele>3400</ele></trkpt>
+      <trkpt lat="45.97784" lon="7.66157"><ele>3550</ele></trkpt>
+      <trkpt lat="45.97712" lon="7.66005"><ele>3700</ele></trkpt>
+      <trkpt lat="45.97638" lon="7.65864"><ele>3870</ele></trkpt>
+      <trkpt lat="45.97562" lon="7.65725"><ele>4040</ele></trkpt>
+      <trkpt lat="45.97481" lon="7.65615"><ele>4200</ele></trkpt>
+      <trkpt lat="45.97394" lon="7.65525"><ele>4350</ele></trkpt>
+      <trkpt lat="45.97301" lon="7.65462"><ele>4478</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

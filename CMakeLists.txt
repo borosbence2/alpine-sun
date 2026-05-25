@@ -117,6 +117,7 @@ add_executable(alpine_sun
     src/terrain_mesh.cpp
     src/psa.cpp
     src/sun_driver.cpp
+    src/gpx.cpp
 )
 
 target_link_libraries(alpine_sun PRIVATE
@@ -133,6 +134,8 @@ target_include_directories(alpine_sun PRIVATE
 target_compile_definitions(alpine_sun PRIVATE
     ALPINE_SUN_MATTERHORN_TILE_PATH="${MATTERHORN_TILE_PATH}"
     ALPINE_SUN_EVEREST_TILE_PATH="${EVEREST_TILE_PATH}"
+    ALPINE_SUN_ROUTE_MATTERHORN_HORNLI="${CMAKE_CURRENT_SOURCE_DIR}/assets/matterhorn-hornli.gpx"
+    ALPINE_SUN_ROUTE_EVEREST_SUMMIT="${CMAKE_CURRENT_SOURCE_DIR}/assets/everest-summit.gpx"
 )
 
 # Shaders — ForfunShaders.cmake's add_shader() is available transitively
@@ -144,6 +147,8 @@ add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/horizon_map.comp"   h
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sun_hours.comp"     sun_hours_comp_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.vert"           sky_vert_spv)
 add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/sky.frag"           sky_frag_spv)
+add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/route.vert"         route_vert_spv)
+add_shader(alpine_sun "${CMAKE_CURRENT_SOURCE_DIR}/shaders/route.frag"         route_frag_spv)
 
 if(MSVC)
     target_compile_options(alpine_sun PRIVATE /W4 /permissive-)
