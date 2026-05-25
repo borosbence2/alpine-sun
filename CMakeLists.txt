@@ -108,6 +108,71 @@ set(MATTERHORN_TILE_PATH "${DEM_DIR}/Copernicus_DSM_COG_10_N45_00_E007_00_DEM.ti
 set(EVEREST_TILE_PATH    "${DEM_DIR}/Copernicus_DSM_COG_10_N27_00_E086_00_DEM.tif")
 
 # ----------------------------------------------------------------------------
+# stb_image header — forfun_core already provides the IMPLEMENTATION symbols
+# via its tinygltf bundle, so we only need the declarations to call stbi_load.
+# Downloaded once at configure time to keep the repo lean.
+# ----------------------------------------------------------------------------
+set(STB_IMAGE_HEADER "${CMAKE_CURRENT_SOURCE_DIR}/src/vendor/stb_image.h")
+if(NOT EXISTS "${STB_IMAGE_HEADER}")
+    file(MAKE_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/src/vendor")
+    message(STATUS "Downloading stb_image.h ...")
+    file(DOWNLOAD
+        "https://raw.githubusercontent.com/nothings/stb/master/stb_image.h"
+        "${STB_IMAGE_HEADER}"
+        STATUS _stb_status)
+    list(GET _stb_status 0 _stb_code)
+    if(NOT _stb_code EQUAL 0)
+        list(GET _stb_status 1 _stb_msg)
+        file(REMOVE "${STB_IMAGE_HEADER}")
+        message(FATAL_ERROR "Failed to download stb_image.h: ${_stb_msg}")
+    endif()
+endif()
+
+# ----------------------------------------------------------------------------
+# Satellite imagery (NASA Worldview Landsat 30 m annual composite).
+# Public, no key, returns JPEG cropped to a lat/lon bbox. We fetch one image
+# per preset at configure time so the binary can use it as terrain albedo.
+# ----------------------------------------------------------------------------
+set(SAT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/assets/sat")
+file(MAKE_DIRECTORY "${SAT_DIR}")
+
+function(alpine_sun_download_sat name min_lat min_lon max_lat max_lon width height)
+    set(_path "${SAT_DIR}/${name}.jpg")
+    if(NOT EXISTS "${_path}")
+        message(STATUS "Downloading satellite imagery for ${name}...")
+        # ESRI World Imagery via the public Export Image REST endpoint.
+        # No API key required for low-volume access; imagery is typically
+        # high-resolution (sub-30 m in most mountain regions). BBOX order
+        # here is xmin,ymin,xmax,ymax = lon,lat,lon,lat with bboxSR=4326.
+        set(_url
+            "https://services.arcgisonline.com/arcgis/rest/services/World_Imagery/MapServer/export"
+            "?bbox=${min_lon},${min_lat},${max_lon},${max_lat}"
+            "&bboxSR=4326"
+            "&imageSR=4326"
+            "&size=${width},${height}"
+            "&format=jpg"
+            "&f=image")
+        string(JOIN "" _url ${_url})
+        file(DOWNLOAD "${_url}" "${_path}" SHOW_PROGRESS STATUS _dl_status)
+        list(GET _dl_status 0 _dl_code)
+        if(NOT _dl_code EQUAL 0)
+            list(GET _dl_status 1 _dl_msg)
+            file(REMOVE "${_path}")
+            message(WARNING "Failed to download sat imagery for ${name}: ${_dl_msg}\n"
+                            "Satellite mode will be unavailable for this preset.")
+        endif()
+    endif()
+endfunction()
+
+# Matterhorn close-up: ~9 km × 10 km, aspect ~1.33
+alpine_sun_download_sat("matterhorn" 45.91 7.60 46.00 7.72 1024 768)
+# Everest close-up:    ~15 km × 10 km, aspect ~1.67
+alpine_sun_download_sat("everest"    27.91 86.85 28.00 87.00 1024 614)
+
+set(SAT_MATTERHORN_PATH "${SAT_DIR}/matterhorn.jpg")
+set(SAT_EVEREST_PATH    "${SAT_DIR}/everest.jpg")
+
+# ----------------------------------------------------------------------------
 # alpine_sun executable
 # ----------------------------------------------------------------------------
 add_executable(alpine_sun
@@ -129,6 +194,7 @@ target_link_libraries(alpine_sun PRIVATE
 
 target_include_directories(alpine_sun PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vendor"
 )
 
 target_compile_definitions(alpine_sun PRIVATE
@@ -136,6 +202,8 @@ target_compile_definitions(alpine_sun PRIVATE
     ALPINE_SUN_EVEREST_TILE_PATH="${EVEREST_TILE_PATH}"
     ALPINE_SUN_ROUTE_MATTERHORN_HORNLI="${CMAKE_CURRENT_SOURCE_DIR}/assets/matterhorn-hornli.gpx"
     ALPINE_SUN_ROUTE_EVEREST_SUMMIT="${CMAKE_CURRENT_SOURCE_DIR}/assets/everest-summit.gpx"
+    ALPINE_SUN_SAT_MATTERHORN_PATH="${SAT_MATTERHORN_PATH}"
+    ALPINE_SUN_SAT_EVEREST_PATH="${SAT_EVEREST_PATH}"
 )
 
 # Shaders — ForfunShaders.cmake's add_shader() is available transitively

@@ -24,6 +24,9 @@
 #include <backends/imgui_impl_glfw.h>
 #include <backends/imgui_impl_vulkan.h>
 
+// Declarations only — implementation lives in forfun_core's tinygltf_impl.cpp.
+#include <stb_image.h>
+
 #include "terrain.vert.h"
 #include "terrain.frag.h"
 #include "terrain_depth.vert.h"
@@ -64,6 +67,7 @@ struct alignas(16) CameraUBO {
     glm::vec4 occlusionParams;       // .x = shadow-map enabled, .y = horizon-map enabled
     glm::vec4 sunHoursParams;        // .x = show sun-hours colormap, .y = max-hours scale
     glm::vec4 toneParams;            // .x = exposure (multiplier before ACES tonemap)
+    glm::vec4 satParams;             // .x = use satellite as albedo, .y = sat texture available
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
@@ -117,6 +121,10 @@ struct SunHoursUi {
 
 struct ToneUi {
     float exposure = 1.0f;
+};
+
+struct SatUi {
+    bool enabled = false;   // off by default — procedural shading is the demo look
 };
 
 // Loaded GPX route. CPU keeps waypoints + ENU vertices around so we can build
@@ -197,6 +205,7 @@ PickRequest    g_pickRequest;
 PickResult     g_pickResult;
 PendingGpxLoad g_pendingGpx;     // populated by the GLFW drop callback; consumed at top of loop
 Route          g_route;
+SatUi          g_sat;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -390,6 +399,10 @@ struct TerrainPreset {
     // Optional GPX route auto-loaded with the preset. Toggleable in the UI
     // via the standard "Show on terrain" checkbox; nullptr means no built-in.
     const char* builtInGpxPath;
+    // Optional satellite-imagery JPEG (CMake-fetched ESRI World Imagery) used
+    // as terrain albedo when the user enables "Satellite mode". nullptr means
+    // satellite imagery is unavailable for this preset.
+    const char* satImagePath;
     const char* description;
 };
 
@@ -403,11 +416,15 @@ const TerrainPreset kPresets[] = {
      7.60, 7.72, 45.91, 46.00, 1,
      45.976, 7.658, 2.0f, 12000.0f,
      ALPINE_SUN_ROUTE_MATTERHORN_HORNLI,
+     ALPINE_SUN_SAT_MATTERHORN_PATH,
      "Matterhorn close-up (~9 km × 10 km) — full DEM detail"},
     // The original wide preset: full 1° tile, stride=8 to keep the mesh tractable.
+    // No bundled satellite imagery; the area is too large for a single ESRI
+    // export to read sharply.
     {"matterhorn-wide", ALPINE_SUN_MATTERHORN_TILE_PATH,
      7.0, 8.0, 45.0, 46.0, 8,
      45.976, 7.658, 2.0f, 30000.0f,
+     nullptr,
      nullptr,
      "Matterhorn region (1° × 1°, ~80 km × 110 km) — coarse mesh"},
     // ~15 km × 10 km centred on Everest (27.988°N, 86.925°E). Includes Lhotse,
@@ -419,6 +436,7 @@ const TerrainPreset kPresets[] = {
      86.85, 87.00, 27.91, 28.00, 1,
      27.988, 86.925, 5.75f, 14000.0f,
      ALPINE_SUN_ROUTE_EVEREST_SUMMIT,
+     ALPINE_SUN_SAT_EVEREST_PATH,
      "Mt Everest close-up (~15 km × 10 km) — full DEM detail"},
 };
 constexpr int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
@@ -787,6 +805,133 @@ int main(int argc, char** argv) {
         vmaDestroyBuffer(gpu.allocator, stagingBuf, stagingAlloc);
         std::printf("gpu: heightmap uploaded — %u x %u R32F (%.1f MB)\n",
                     tile.width, tile.height, demBytes / (1024.0 * 1024.0));
+    }
+
+    // ---- Optional satellite imagery (terrain albedo override) ----
+    // R8G8B8A8_SRGB so the sampler does sRGB→linear on read; ACES tonemap then
+    // brings it back. A 1×1 black fallback keeps the descriptor binding always
+    // valid even when the preset has no bundled image (e.g. matterhorn-wide).
+    VkImage         satImage      = VK_NULL_HANDLE;
+    VkImageView     satView       = VK_NULL_HANDLE;
+    VmaAllocation   satAlloc      = VK_NULL_HANDLE;
+    VkSampler       satSampler    = VK_NULL_HANDLE;
+    bool            satImageReady = false;
+    uint32_t        satWidth      = 1;
+    uint32_t        satHeight     = 1;
+    {
+        // Resolve source: preset's bundled JPEG if present, otherwise a 1×1
+        // black placeholder. Either way we end up with `pixels` (RGBA) of
+        // size satWidth*satHeight*4 bytes.
+        std::vector<uint8_t> placeholder;
+        const uint8_t* pixels    = nullptr;
+        uint8_t*       stbPixels = nullptr;
+        if (preset.satImagePath != nullptr) {
+            int w = 0, h = 0, n = 0;
+            stbPixels = stbi_load(preset.satImagePath, &w, &h, &n, /*req_comp=*/4);
+            if (stbPixels != nullptr) {
+                satWidth      = static_cast<uint32_t>(w);
+                satHeight     = static_cast<uint32_t>(h);
+                pixels        = stbPixels;
+                satImageReady = true;
+            } else {
+                std::fprintf(stderr, "sat: failed to load %s: %s\n",
+                             preset.satImagePath, stbi_failure_reason());
+            }
+        }
+        if (pixels == nullptr) {
+            placeholder.assign(4, 0);
+            pixels = placeholder.data();
+        }
+
+        const VkDeviceSize bytes = VkDeviceSize(satWidth) * satHeight * 4;
+
+        VkBufferCreateInfo stagingCi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        stagingCi.size  = bytes;
+        stagingCi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+        VmaAllocationCreateInfo stagingAllocCi{};
+        stagingAllocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        stagingAllocCi.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
+                             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+        VkBuffer          stagingBuf  = VK_NULL_HANDLE;
+        VmaAllocation     stagingAlloc = VK_NULL_HANDLE;
+        VmaAllocationInfo stagingInfo{};
+        VK_CHECK(vmaCreateBuffer(gpu.allocator, &stagingCi, &stagingAllocCi,
+                                 &stagingBuf, &stagingAlloc, &stagingInfo));
+        std::memcpy(stagingInfo.pMappedData, pixels, static_cast<size_t>(bytes));
+
+        VkImageCreateInfo imgCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+        imgCi.imageType     = VK_IMAGE_TYPE_2D;
+        imgCi.format        = VK_FORMAT_R8G8B8A8_SRGB;
+        imgCi.extent        = {satWidth, satHeight, 1};
+        imgCi.mipLevels     = 1;
+        imgCi.arrayLayers   = 1;
+        imgCi.samples       = VK_SAMPLE_COUNT_1_BIT;
+        imgCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
+        imgCi.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        imgCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+        VmaAllocationCreateInfo imgAllocCi{};
+        imgAllocCi.usage = VMA_MEMORY_USAGE_AUTO;
+        VK_CHECK(vmaCreateImage(gpu.allocator, &imgCi, &imgAllocCi,
+                                &satImage, &satAlloc, nullptr));
+
+        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        cbAi.commandPool        = uploadPool;
+        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        cbAi.commandBufferCount = 1;
+        VkCommandBuffer cmd = VK_NULL_HANDLE;
+        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
+
+        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
+        transitionImage(cmd, satImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+        VkBufferImageCopy region{};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent = {satWidth, satHeight, 1};
+        vkCmdCopyBufferToImage(cmd, stagingBuf, satImage,
+                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+        transitionImage(cmd, satImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
+                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+        VK_CHECK(vkEndCommandBuffer(cmd));
+
+        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        sub.commandBufferCount = 1;
+        sub.pCommandBuffers    = &cmd;
+        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
+        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
+        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
+        vmaDestroyBuffer(gpu.allocator, stagingBuf, stagingAlloc);
+        if (stbPixels != nullptr) stbi_image_free(stbPixels);
+
+        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vci.image            = satImage;
+        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+        vci.format           = VK_FORMAT_R8G8B8A8_SRGB;
+        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &satView));
+
+        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
+        sCi.magFilter    = VK_FILTER_LINEAR;
+        sCi.minFilter    = VK_FILTER_LINEAR;
+        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &satSampler));
+
+        if (satImageReady) {
+            std::printf("gpu: satellite imagery uploaded — %u x %u sRGB\n",
+                        satWidth, satHeight);
+            g_sat.enabled = true;   // default ON when imagery is available
+        }
     }
 
     // ---- Bake horizon map (one-time compute dispatch) ----
@@ -1235,12 +1380,13 @@ int main(int argc, char** argv) {
                                    VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
     }
 
-    // Four bindings in one set:
+    // Five bindings in one set:
     //   b0 = camera UBO (both stages),
     //   b1 = shadow map sampler2D (frag),
     //   b2 = horizon map sampler2DArray (frag),
-    //   b3 = sun-hours sampler2D (frag).
-    VkDescriptorSetLayoutBinding setBindings[4]{};
+    //   b3 = sun-hours sampler2D (frag),
+    //   b4 = satellite imagery sampler2D (frag).
+    VkDescriptorSetLayoutBinding setBindings[5]{};
     setBindings[0].binding         = 0;
     setBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     setBindings[0].descriptorCount = 1;
@@ -1257,9 +1403,13 @@ int main(int argc, char** argv) {
     setBindings[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     setBindings[3].descriptorCount = 1;
     setBindings[3].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
+    setBindings[4].binding         = 4;
+    setBindings[4].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    setBindings[4].descriptorCount = 1;
+    setBindings[4].stageFlags      = VK_SHADER_STAGE_FRAGMENT_BIT;
 
     VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dslCi.bindingCount = 4;
+    dslCi.bindingCount = 5;
     dslCi.pBindings    = setBindings;
     VkDescriptorSetLayout cameraSetLayout = VK_NULL_HANDLE;
     VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &cameraSetLayout));
@@ -1268,7 +1418,7 @@ int main(int argc, char** argv) {
     poolSizes[0].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     poolSizes[0].descriptorCount = kFramesInFlight;
     poolSizes[1].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = kFramesInFlight * 3;  // shadow + horizon + sun-hours per frame
+    poolSizes[1].descriptorCount = kFramesInFlight * 4;  // shadow + horizon + sun-hours + sat per frame
     VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     dpCi.maxSets       = kFramesInFlight;
     dpCi.poolSizeCount = 2;
@@ -1303,7 +1453,12 @@ int main(int argc, char** argv) {
         sunHoursInfo.imageView   = sunHoursSampleView;
         sunHoursInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-        VkWriteDescriptorSet writes[4]{};
+        VkDescriptorImageInfo satInfo{};
+        satInfo.sampler     = satSampler;
+        satInfo.imageView   = satView;
+        satInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+        VkWriteDescriptorSet writes[5]{};
         writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         writes[0].dstSet          = cameraDescSets[i];
         writes[0].dstBinding      = 0;
@@ -1328,7 +1483,13 @@ int main(int argc, char** argv) {
         writes[3].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         writes[3].descriptorCount = 1;
         writes[3].pImageInfo      = &sunHoursInfo;
-        vkUpdateDescriptorSets(gpu.device, 4, writes, 0, nullptr);
+        writes[4].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[4].dstSet          = cameraDescSets[i];
+        writes[4].dstBinding      = 4;
+        writes[4].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+        writes[4].descriptorCount = 1;
+        writes[4].pImageInfo      = &satInfo;
+        vkUpdateDescriptorSets(gpu.device, 5, writes, 0, nullptr);
     }
 
     // ---- Terrain pipeline ----
@@ -2001,6 +2162,18 @@ int main(int argc, char** argv) {
             ImGui::SetItemTooltip("Linear multiplier before the ACES tonemap.\n"
                                   "Higher = brighter midtones, faster roll-off into white.\n"
                                   "Does not affect the sun-hours colormap.");
+            if (satImageReady) {
+                ImGui::Checkbox("Satellite albedo", &g_sat.enabled);
+                ImGui::SetItemTooltip("Replace the procedural grass/rock/snow ramp with the\n"
+                                      "preset's bundled satellite imagery (ESRI World Imagery).\n"
+                                      "Sun-hours colormap still wins when that mode is on.");
+            } else {
+                ImGui::BeginDisabled();
+                bool dummy = false;
+                ImGui::Checkbox("Satellite albedo", &dummy);
+                ImGui::EndDisabled();
+                ImGui::SetItemTooltip("No satellite imagery is bundled with this preset.");
+            }
             ImGui::Separator();
             ImGui::TextUnformatted("Picked point");
             ImGui::TextDisabled("(right-click on terrain to sample)");
@@ -2099,6 +2272,9 @@ int main(int argc, char** argv) {
                                        g_sunHours.maxHoursScale,
                                        0.0f, 0.0f);
         cam.toneParams = glm::vec4(g_tone.exposure, 0.0f, 0.0f, 0.0f);
+        cam.satParams  = glm::vec4(g_sat.enabled    ? 1.0f : 0.0f,
+                                   satImageReady    ? 1.0f : 0.0f,
+                                   0.0f, 0.0f);
         cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
                                     mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
@@ -2479,6 +2655,9 @@ int main(int argc, char** argv) {
     vkDestroySampler(gpu.device, heightMapSampler, nullptr);
     vkDestroyImageView(gpu.device, heightMapView, nullptr);
     vmaDestroyImage(gpu.allocator, heightMapImage, heightMapAlloc);
+    vkDestroySampler(gpu.device, satSampler, nullptr);
+    vkDestroyImageView(gpu.device, satView, nullptr);
+    vmaDestroyImage(gpu.allocator, satImage, satAlloc);
     vkDestroySampler(gpu.device, shadowSampler, nullptr);
     vkDestroyImageView(gpu.device, shadowMap.view, nullptr);
     vmaDestroyImage(gpu.allocator, shadowMap.image, shadowMap.allocation);

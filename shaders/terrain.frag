@@ -10,12 +10,14 @@ layout(set = 0, binding = 0) uniform Camera {
     vec4 occlusionParams;      // .x = shadow-map enabled, .y = horizon-map enabled
     vec4 sunHoursParams;       // .x = show colormap, .y = max-hours scale
     vec4 toneParams;           // .x = exposure (linear multiplier before ACES)
+    vec4 satParams;            // .x = use satellite albedo, .y = sat image is real
     vec4 terrainAabb;          // .xy = aabbMin, .zw = aabbMax (xy components only)
 } cam;
 
 layout(set = 0, binding = 1) uniform sampler2D      uShadowMap;
 layout(set = 0, binding = 2) uniform sampler2DArray uHorizonMap;
 layout(set = 0, binding = 3) uniform sampler2D      uSunHours;
+layout(set = 0, binding = 4) uniform sampler2D      uSatellite;
 
 layout(location = 0) in vec3 vNormal;
 layout(location = 1) in float vHeight;
@@ -135,6 +137,16 @@ void main() {
     vec3 albedo = mix(grass,  rock, smoothstep(0.30, 0.55, h));
     albedo      = mix(albedo, snow, smoothstep(0.55, 0.80, h));
     albedo      = mix(albedo, rock, slope * 0.6);
+
+    // Satellite override — only when the user enabled it AND the preset
+    // actually has a bundled image (otherwise the placeholder 1x1 black would
+    // wipe the terrain).
+    if (cam.satParams.x > 0.5 && cam.satParams.y > 0.5) {
+        vec2 satUv = worldToHorizonUv(vWorldPos);   // same world→UV mapping as horizon/sun-hours
+        if (all(greaterThanEqual(satUv, vec2(0.0))) && all(lessThanEqual(satUv, vec2(1.0)))) {
+            albedo = texture(uSatellite, satUv).rgb;
+        }
+    }
 
     vec3  sunDir = cam.sunDirAndIrradiance.xyz;
     float ndotl  = max(0.0, dot(N, sunDir));
