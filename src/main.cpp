@@ -1,9 +1,9 @@
 // alpine-sun — entry point.
 //
-// Phase 1 in progress. On startup, loads the Matterhorn DEM tile, generates
-// a terrain mesh, then creates a Vulkan device via forfun_core. Opens a
-// window and runs an empty event loop. Actual rendering arrives once the
-// rest of Phase 0B is extracted (Swapchain, FrameContext).
+// Phase 1c: actually draws the Matterhorn terrain mesh. Camera is hardcoded
+// for now (orbit/fly controls arrive in A1.terrain.6). Slope/height debug
+// shading + placeholder fixed-sun Lambert lighting (real sun via SPA in
+// Phase 2).
 
 #define GLFW_INCLUDE_VULKAN
 #include <GLFW/glfw3.h>
@@ -13,15 +13,30 @@
 #include "device.h"        // forfun::createDevice / destroyDevice
 #include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
 #include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
-#include "vk_helpers.h"    // transitionImage
-#include "types.h"         // VK_CHECK, kFramesInFlight
+#include "vk_helpers.h"    // transitionImage, createBufferGPU/HostMapped, etc.
+#include "types.h"         // VK_CHECK, kFramesInFlight, Vertex, kDepthFormat
+
+#include <glm/gtc/matrix_transform.hpp>
+
+#include "terrain.vert.h"
+#include "terrain.frag.h"
 
 #include <array>
-
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace {
+
+// std140-ish camera block. All three matrices are written each frame; the
+// shader uses viewProj, but view+proj are kept for future passes (shadow,
+// horizon precompute) that may want them separately.
+struct alignas(16) CameraUBO {
+    glm::mat4 view;
+    glm::mat4 proj;
+    glm::mat4 viewProj;
+};
 
 terrain::Mesh loadAndBuildTerrain() {
     dem::Tile tile;
@@ -159,6 +174,153 @@ int main() {
     std::printf("gpu: terrain uploaded — VB %.1f MB, IB %.1f MB\n",
                 vbBytes / (1024.0 * 1024.0), ibBytes / (1024.0 * 1024.0));
 
+    // ---- Camera UBO + per-frame descriptor sets ----
+    std::array<Buffer, kFramesInFlight> cameraUbos{};
+    for (auto& b : cameraUbos) {
+        b = createBufferHostMapped(gpu.allocator, sizeof(CameraUBO),
+                                   VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
+    }
+
+    VkDescriptorSetLayoutBinding camBinding{};
+    camBinding.binding         = 0;
+    camBinding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    camBinding.descriptorCount = 1;
+    camBinding.stageFlags      = VK_SHADER_STAGE_VERTEX_BIT;
+
+    VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+    dslCi.bindingCount = 1;
+    dslCi.pBindings    = &camBinding;
+    VkDescriptorSetLayout cameraSetLayout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &cameraSetLayout));
+
+    VkDescriptorPoolSize poolSize{};
+    poolSize.type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+    poolSize.descriptorCount = kFramesInFlight;
+    VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+    dpCi.maxSets       = kFramesInFlight;
+    dpCi.poolSizeCount = 1;
+    dpCi.pPoolSizes    = &poolSize;
+    VkDescriptorPool descPool = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &descPool));
+
+    std::array<VkDescriptorSet, kFramesInFlight> cameraDescSets{};
+    for (uint32_t i = 0; i < kFramesInFlight; ++i) {
+        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+        ai.descriptorPool     = descPool;
+        ai.descriptorSetCount = 1;
+        ai.pSetLayouts        = &cameraSetLayout;
+        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &cameraDescSets[i]));
+
+        VkDescriptorBufferInfo bi{};
+        bi.buffer = cameraUbos[i].buffer;
+        bi.range  = sizeof(CameraUBO);
+
+        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w.dstSet          = cameraDescSets[i];
+        w.dstBinding      = 0;
+        w.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        w.descriptorCount = 1;
+        w.pBufferInfo     = &bi;
+        vkUpdateDescriptorSets(gpu.device, 1, &w, 0, nullptr);
+    }
+
+    // ---- Terrain pipeline ----
+    VkShaderModule vertModule = createShaderModule(gpu.device, terrain_vert_spv, sizeof(terrain_vert_spv));
+    VkShaderModule fragModule = createShaderModule(gpu.device, terrain_frag_spv, sizeof(terrain_frag_spv));
+
+    VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    plCi.setLayoutCount = 1;
+    plCi.pSetLayouts    = &cameraSetLayout;
+    VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
+    VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &pipelineLayout));
+
+    VkPipelineShaderStageCreateInfo stages[2]{
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+        {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO},
+    };
+    stages[0].stage  = VK_SHADER_STAGE_VERTEX_BIT;
+    stages[0].module = vertModule;
+    stages[0].pName  = "main";
+    stages[1].stage  = VK_SHADER_STAGE_FRAGMENT_BIT;
+    stages[1].module = fragModule;
+    stages[1].pName  = "main";
+
+    VkVertexInputBindingDescription vbBinding{};
+    vbBinding.binding   = 0;
+    vbBinding.stride    = sizeof(Vertex);
+    vbBinding.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+    VkVertexInputAttributeDescription vbAttrs[3]{};
+    vbAttrs[0] = {0, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, pos)};
+    vbAttrs[1] = {1, 0, VK_FORMAT_R32G32B32_SFLOAT, offsetof(Vertex, normal)};
+    vbAttrs[2] = {2, 0, VK_FORMAT_R32G32_SFLOAT,    offsetof(Vertex, uv)};
+
+    VkPipelineVertexInputStateCreateInfo vi{VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vi.vertexBindingDescriptionCount   = 1;
+    vi.pVertexBindingDescriptions      = &vbBinding;
+    vi.vertexAttributeDescriptionCount = 3;
+    vi.pVertexAttributeDescriptions    = vbAttrs;
+
+    VkPipelineInputAssemblyStateCreateInfo ia{VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    ia.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+
+    VkPipelineViewportStateCreateInfo vp{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    vp.viewportCount = 1;
+    vp.scissorCount  = 1;
+
+    VkPipelineRasterizationStateCreateInfo rs{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
+    rs.polygonMode = VK_POLYGON_MODE_FILL;
+    rs.cullMode    = VK_CULL_MODE_BACK_BIT;
+    rs.frontFace   = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    rs.lineWidth   = 1.0f;
+
+    VkPipelineMultisampleStateCreateInfo ms{VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO};
+    ms.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT;
+
+    VkPipelineDepthStencilStateCreateInfo ds{VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    ds.depthTestEnable  = VK_TRUE;
+    ds.depthWriteEnable = VK_TRUE;
+    ds.depthCompareOp   = VK_COMPARE_OP_LESS;
+
+    VkPipelineColorBlendAttachmentState cba{};
+    cba.colorWriteMask = VK_COLOR_COMPONENT_R_BIT | VK_COLOR_COMPONENT_G_BIT
+                       | VK_COLOR_COMPONENT_B_BIT | VK_COLOR_COMPONENT_A_BIT;
+    VkPipelineColorBlendStateCreateInfo cb{VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO};
+    cb.attachmentCount = 1;
+    cb.pAttachments    = &cba;
+
+    VkDynamicState dynStates[2] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dyn{VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dyn.dynamicStateCount = 2;
+    dyn.pDynamicStates    = dynStates;
+
+    VkPipelineRenderingCreateInfo prCi{VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO};
+    prCi.colorAttachmentCount    = 1;
+    prCi.pColorAttachmentFormats = &sc.imageFormat;
+    prCi.depthAttachmentFormat   = kDepthFormat;
+
+    VkGraphicsPipelineCreateInfo gpCi{VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO};
+    gpCi.pNext               = &prCi;
+    gpCi.stageCount          = 2;
+    gpCi.pStages             = stages;
+    gpCi.pVertexInputState   = &vi;
+    gpCi.pInputAssemblyState = &ia;
+    gpCi.pViewportState      = &vp;
+    gpCi.pRasterizationState = &rs;
+    gpCi.pMultisampleState   = &ms;
+    gpCi.pDepthStencilState  = &ds;
+    gpCi.pColorBlendState    = &cb;
+    gpCi.pDynamicState       = &dyn;
+    gpCi.layout              = pipelineLayout;
+    VkPipeline terrainPipeline = VK_NULL_HANDLE;
+    VK_CHECK(vkCreateGraphicsPipelines(gpu.device, VK_NULL_HANDLE, 1, &gpCi, nullptr, &terrainPipeline));
+
+    // Shader modules can be destroyed once the pipeline is built.
+    vkDestroyShaderModule(gpu.device, fragModule, nullptr);
+    vkDestroyShaderModule(gpu.device, vertModule, nullptr);
+
+    std::printf("gpu: terrain pipeline ready\n");
+
     std::printf("alpine-sun: window open. Press ESC to quit.\n");
 
     // Dawn-on-snow tint: pale warm pink. Distinctive enough to confirm the
@@ -218,8 +380,46 @@ int main() {
         renderingInfo.pColorAttachments    = &colorAttachment;
         renderingInfo.pDepthAttachment     = &depthAttachment;
 
+        // ---- Camera (hardcoded view; controls arrive in A1.terrain.6) ----
+        // Look at the tile centre from the south-west, well above the highest
+        // peak so the whole massif fits in frame.
+        const glm::vec3 eye    = glm::vec3(-60000.0f, -60000.0f, 35000.0f);
+        const glm::vec3 center = glm::vec3(     0.0f,      0.0f,  2000.0f);
+        const glm::vec3 upVec  = glm::vec3(     0.0f,      0.0f,     1.0f);
+
+        const float aspect = static_cast<float>(sc.extent.width)
+                           / static_cast<float>(sc.extent.height);
+
+        CameraUBO cam{};
+        cam.view = glm::lookAt(eye, center, upVec);
+        cam.proj = glm::perspective(glm::radians(60.0f), aspect, 100.0f, 300000.0f);
+        cam.proj[1][1] *= -1.0f;             // Vulkan NDC y-flip
+        cam.viewProj = cam.proj * cam.view;
+        std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));
+
         vkCmdBeginRendering(frame.cmd, &renderingInfo);
-        // (terrain draws go here in A1.terrain.7)
+
+        VkViewport viewport{};
+        viewport.x        = 0.0f;
+        viewport.y        = 0.0f;
+        viewport.width    = static_cast<float>(sc.extent.width);
+        viewport.height   = static_cast<float>(sc.extent.height);
+        viewport.minDepth = 0.0f;
+        viewport.maxDepth = 1.0f;
+        vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+
+        VkRect2D scissor{{0, 0}, sc.extent};
+        vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+
+        vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, terrainPipeline);
+        vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                pipelineLayout, 0, 1, &cameraDescSets[frameIndex], 0, nullptr);
+
+        VkDeviceSize vbOffset = 0;
+        vkCmdBindVertexBuffers(frame.cmd, 0, 1, &terrainVB.buffer, &vbOffset);
+        vkCmdBindIndexBuffer  (frame.cmd, terrainIB.buffer, 0, VK_INDEX_TYPE_UINT32);
+        vkCmdDrawIndexed      (frame.cmd, static_cast<uint32_t>(mesh.indices.size()), 1, 0, 0, 0);
+
         vkCmdEndRendering(frame.cmd);
 
         transitionImage(frame.cmd, sc.images[imageIndex], VK_IMAGE_ASPECT_COLOR_BIT,
@@ -267,6 +467,11 @@ int main() {
     // Make sure the GPU is idle before tearing down resources still in use.
     VK_CHECK(vkDeviceWaitIdle(gpu.device));
 
+    vkDestroyPipeline(gpu.device, terrainPipeline, nullptr);
+    vkDestroyPipelineLayout(gpu.device, pipelineLayout, nullptr);
+    vkDestroyDescriptorPool(gpu.device, descPool, nullptr);
+    vkDestroyDescriptorSetLayout(gpu.device, cameraSetLayout, nullptr);
+    for (auto& b : cameraUbos) vmaDestroyBuffer(gpu.allocator, b.buffer, b.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
     vkDestroyImageView(gpu.device, depth.view, nullptr);

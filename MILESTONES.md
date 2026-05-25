@@ -70,15 +70,15 @@ controls → final scene).
 | A1.render.0   | Render-loop skeleton: acquire → record → submit → present, clear-color only | DONE  |
 | A1.render.1   | Depth attachment (transitioned once to DEPTH_OPTIMAL; CLEAR loadOp per frame) | DONE |
 | A1.render.2   | Upload terrain VB (6.2 MB) + IB (4.6 MB) via staging (uploadToBuffer)      | DONE   |
-| A1.render.3   | Camera UBO + descriptor set (view + projection matrices)                   | TODO   |
+| A1.render.3   | Camera UBO (view + proj + viewProj) + descriptor set per frame             | DONE   |
 
 ### Phase 1c — Terrain rendering
 
 | ID            | Description                                                                | Status |
 |---------------|----------------------------------------------------------------------------|--------|
-| A1.terrain.5  | Terrain shader: start with hand-written GLSL (slope/height debug), revisit .mat once PBR is wanted | TODO |
+| A1.terrain.5  | Hand-written GLSL terrain shader (slope/height debug + fixed-sun Lambert) + graphics pipeline + draw call | DONE |
 | A1.terrain.6  | Orbit camera (target = summit) + fly mode toggle (GLFW input → camera)     | TODO   |
-| A1.terrain.7  | Render Matterhorn end-to-end, depth-tested, with sky backdrop              | TODO   |
+| A1.terrain.7  | Tone-mapped HDR, sky backdrop, polish                                      | TODO   |
 
 ## Phase 2 — Sun positioning
 
