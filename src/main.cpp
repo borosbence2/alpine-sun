@@ -71,6 +71,7 @@ struct alignas(16) CameraUBO {
     glm::vec4 toneParams;            // .x = exposure (multiplier before ACES tonemap)
     glm::vec4 satParams;             // .x = use satellite as albedo, .y = sat texture available
     glm::vec4 avalancheParams;       // .x = show overlay, .y = solar-loading enabled
+    glm::vec4 cameraPos;             // world ENU camera position (.w unused), for aerial perspective
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
@@ -2864,6 +2865,7 @@ int main(int argc, char** argv) {
         cam.avalancheParams = glm::vec4(g_avalanche.enabled                        ? 1.0f : 0.0f,
                                         (g_avalanche.enabled && g_avalanche.solarLoading) ? 1.0f : 0.0f,
                                         0.0f, 0.0f);
+        cam.cameraPos = glm::vec4(eye, 0.0f);
         cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
                                     mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));

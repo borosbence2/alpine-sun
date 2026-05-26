@@ -189,11 +189,19 @@ faces pick up cool blue from the zenith at noon; at sunset, faces oriented
 toward the sun pick up warm orange. A tiny constant floor keeps shaded
 areas readable on moonless nights.
 
+**Aerial perspective**: terrain pixels also blend toward the sky colour in
+the *view* direction as the distance from the camera grows, with density
+falling off by altitude (valleys haze more than peaks at the same range).
+A cheap inline approximation of Hillaire's 3D aerial-perspective LUT —
+captures the dominant "distant ridges go cool blue" look without a new
+bake. At sunset the haze picks up the warm horizon glow automatically.
+
 Both sky and terrain pass through the same ACES (Narkowicz fit) tonemap
 with a user-controlled exposure.
 
-Not yet implemented: multi-scattering LUT and aerial perspective. The
-single-scattering single-bounce result already covers the dominant visual.
+Not yet implemented: multi-scattering LUT and a proper 3D aerial-perspective
+volume. The inline aerial-perspective approximation in `terrain.frag`
+covers the dominant visual without needing the volume.
 
 ### GPX routes
 

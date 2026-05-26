@@ -18,6 +18,7 @@ layout(set = 0, binding = 0) uniform Camera {
     vec4 toneParams;
     vec4 satParams;
     vec4 avalancheParams;
+    vec4 cameraPos;
     vec4 terrainAabb;
 } cam;
 

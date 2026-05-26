@@ -12,6 +12,7 @@ layout(set = 0, binding = 0) uniform Camera {
     vec4 toneParams;           // .x = exposure (linear multiplier before ACES)
     vec4 satParams;            // .x = use satellite albedo, .y = sat image is real
     vec4 avalancheParams;      // .x = overlay enabled, .y = solar-loading enabled
+    vec4 cameraPos;            // world ENU position of the camera (.w unused)
     vec4 terrainAabb;          // .xy = aabbMin, .zw = aabbMax (xy components only)
 } cam;
 
@@ -189,6 +190,29 @@ void main() {
     vec3 ambient = sampleSky(ambientDir) * 0.06 + vec3(0.012);
 
     vec3 linearColor = albedo * (ambient + vec3(0.75 * direct));
+
+    // --- Aerial perspective ---
+    // Cheap atmospheric haze: blend toward the sky colour in the view direction
+    // as the distance from camera grows. Extinction is exponential with both
+    // distance AND altitude (so high-altitude pixels haze less than valley
+    // pixels at the same range). Real Hillaire AP uses a 3D LUT; this inline
+    // approximation captures the dominant visual at a fraction of the cost.
+    {
+        vec3  toFrag = vWorldPos - cam.cameraPos.xyz;
+        float dist   = length(toFrag);
+        vec3  viewDir = toFrag / max(dist, 1e-3);
+        // Mean altitude of the camera-fragment segment, in km.
+        float meanH = max(0.0, (cam.cameraPos.z + vWorldPos.z) * 0.5) * 0.001;
+        // Density falls off with altitude (mostly Mie-like haze; ~1.5 km scale).
+        float density = exp(-meanH / 1.5);
+        // 1 - transmittance over the path. Tuning constant chosen so a 20 km
+        // path through valley air noticeably hazes.
+        const float kHazeStrength = 0.00012;
+        float fog = 1.0 - exp(-dist * density * kHazeStrength);
+        vec3 hazeColor = sampleSky(viewDir);
+        linearColor = mix(linearColor, hazeColor, clamp(fog, 0.0, 0.85));
+    }
+
     vec3 lit = acesFilm(linearColor * cam.toneParams.x);
 
     // --- Avalanche terrain overlay ---
