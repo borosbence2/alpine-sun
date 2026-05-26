@@ -16,6 +16,7 @@ layout(set = 0, binding = 0) uniform Camera {
     vec4 sunHoursParams;
     vec4 toneParams;            // .x = exposure
     vec4 satParams;
+    vec4 avalancheParams;
     vec4 terrainAabb;
 } cam;
 

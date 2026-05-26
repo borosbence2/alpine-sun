@@ -11,6 +11,7 @@ layout(set = 0, binding = 0) uniform Camera {
     vec4 sunHoursParams;       // .x = show colormap, .y = max-hours scale
     vec4 toneParams;           // .x = exposure (linear multiplier before ACES)
     vec4 satParams;            // .x = use satellite albedo, .y = sat image is real
+    vec4 avalancheParams;      // .x = overlay enabled, .y = solar-loading enabled
     vec4 terrainAabb;          // .xy = aabbMin, .zw = aabbMax (xy components only)
 } cam;
 
@@ -188,5 +189,52 @@ void main() {
     vec3 ambient = sampleSky(ambientDir) * 0.06 + vec3(0.012);
 
     vec3 linearColor = albedo * (ambient + vec3(0.75 * direct));
-    outColor = vec4(acesFilm(linearColor * cam.toneParams.x), 1.0);
+    vec3 lit = acesFilm(linearColor * cam.toneParams.x);
+
+    // --- Avalanche terrain overlay ---
+    // Heuristic only: blends an industry-standard slope-angle ramp over the
+    // tonemapped image. The ramp peaks at 35–40°, fading to nothing below
+    // 27° (snow rarely slides) and above 50° (snow doesn't accumulate).
+    // When solar-loading is on, south-facing high-sun-hours slopes get a
+    // saturation bump (wet-avalanche bias). The colour stays a UI decal —
+    // applied after tonemap so exposure scrubbing doesn't shift the hazard
+    // hue and ACES can't desaturate the warning reds.
+    if (cam.avalancheParams.x > 0.5) {
+        float slopeDeg = degrees(acos(clamp(N.z, -1.0, 1.0)));
+        vec3  hazCol   = vec3(0.0);
+        float hazW     = 0.0;
+        if (slopeDeg >= 27.0 && slopeDeg <= 55.0) {
+            // Discrete colour brackets matching FATMAP/CalTopo conventions.
+            if      (slopeDeg < 30.0) hazCol = vec3(0.95, 0.90, 0.20);  // yellow
+            else if (slopeDeg < 35.0) hazCol = vec3(1.00, 0.55, 0.10);  // orange
+            else if (slopeDeg < 40.0) hazCol = vec3(0.95, 0.18, 0.18);  // red
+            else if (slopeDeg < 45.0) hazCol = vec3(0.65, 0.08, 0.32);  // deep red
+            else                       hazCol = vec3(0.40, 0.05, 0.30);  // dark purple
+            // Triangular weight peaking at 38°; falls to 0 at the 27° and 55°
+            // bracket edges. Smoothstep so the boundary isn't a hard line.
+            float w = 1.0 - abs(slopeDeg - 38.0) / 17.0;
+            hazW = clamp(w, 0.0, 1.0);
+        }
+
+        if (cam.avalancheParams.y > 0.5 && hazW > 0.0) {
+            // Solar loading: south-facing slopes with lots of direct sun are
+            // wet-slide-prone in spring afternoons. South in ENU = -Y.
+            vec2 horiz = vec2(N.x, N.y);
+            float horizLen = max(length(horiz), 1e-3);
+            float southness = max(0.0, -N.y / horizLen);
+            vec2 huv = worldToHorizonUv(vWorldPos);
+            float sunH = texture(uSunHours, huv).r;
+            float sunFactor = clamp(sunH / 8.0, 0.0, 1.0);
+            float wetBoost = sunFactor * southness;
+            // Push toward saturated red and raise weight so the overlay reads
+            // as "warmer" hazard on the sun-loaded faces.
+            hazCol = mix(hazCol, vec3(1.0, 0.08, 0.05), wetBoost * 0.55);
+            hazW   = clamp(hazW + wetBoost * 0.25, 0.0, 1.0);
+        }
+
+        // Moderate opacity so terrain structure remains visible underneath.
+        lit = mix(lit, hazCol, hazW * 0.65);
+    }
+
+    outColor = vec4(lit, 1.0);
 }

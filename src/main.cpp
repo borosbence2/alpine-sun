@@ -70,6 +70,7 @@ struct alignas(16) CameraUBO {
     glm::vec4 sunHoursParams;        // .x = show sun-hours colormap, .y = max-hours scale
     glm::vec4 toneParams;            // .x = exposure (multiplier before ACES tonemap)
     glm::vec4 satParams;             // .x = use satellite as albedo, .y = sat texture available
+    glm::vec4 avalancheParams;       // .x = show overlay, .y = solar-loading enabled
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
 
@@ -135,6 +136,15 @@ struct ToneUi {
 
 struct SatUi {
     bool enabled = false;   // off by default — procedural shading is the demo look
+};
+
+// Avalanche terrain overlay. Heuristic colour map of slope-angle brackets
+// (industry standard ≈ 27–50° is "avalanche terrain"), optionally amplified
+// for south-facing high-sun-hours slopes (wet-slide bias). Off by default;
+// has a visible disclaimer in the UI that it is NOT a hazard forecast.
+struct AvalancheUi {
+    bool enabled       = false;
+    bool solarLoading  = true;   // checked by default once the overlay is on
 };
 
 // Loaded GPX route. CPU keeps waypoints + ENU vertices around so we can build
@@ -225,6 +235,7 @@ SunUi       g_sun;
 ShadowUi    g_shadow;
 SunHoursUi  g_sunHours;
 ToneUi      g_tone;
+AvalancheUi g_avalanche;
 PickRequest    g_pickRequest;
 PickResult     g_pickResult;
 HoverResult    g_hover;
@@ -2687,6 +2698,49 @@ int main(int argc, char** argv) {
                                   "Lower = more contrast at shaded points; higher = covers\n"
                                   "longer summer days without clipping.");
             ImGui::Separator();
+            ImGui::TextUnformatted("Avalanche terrain (heuristic)");
+            ImGui::Checkbox("Show overlay", &g_avalanche.enabled);
+            ImGui::SetItemTooltip("Industry-standard slope-angle bracket colouring blended\n"
+                                  "over the terrain. Peaks at 35–40° (prime slab terrain).\n"
+                                  "Disposition only — not a hazard forecast.");
+            if (g_avalanche.enabled) {
+                ImGui::Checkbox("Solar loading (wet-slide)", &g_avalanche.solarLoading);
+                ImGui::SetItemTooltip("Bump red on south-facing slopes with high daily sun-hours.\n"
+                                      "Spring/afternoon wet-avalanche bias — heuristic only.");
+
+                // Compact discrete legend matching the shader's brackets.
+                struct Bracket { const char* label; ImU32 col; };
+                const Bracket brackets[] = {
+                    {"27–30°",  IM_COL32(242, 230, 51, 255)},   // yellow
+                    {"30–35°",  IM_COL32(255, 140, 26, 255)},   // orange
+                    {"35–40°",  IM_COL32(242, 46, 46, 255)},    // red
+                    {"40–45°",  IM_COL32(166, 20, 82, 255)},    // deep red
+                    {"45–55°",  IM_COL32(102, 13, 77, 255)},    // dark purple
+                };
+                ImDrawList* draw = ImGui::GetWindowDrawList();
+                const float swatchW = 32.0f, swatchH = 14.0f, gap = 4.0f;
+                ImVec2 p0 = ImGui::GetCursorScreenPos();
+                for (int i = 0; i < int(std::size(brackets)); ++i) {
+                    const ImVec2 a(p0.x + i * (swatchW + gap),     p0.y);
+                    const ImVec2 b(a.x + swatchW,                   p0.y + swatchH);
+                    draw->AddRectFilled(a, b, brackets[i].col);
+                }
+                ImGui::Dummy(ImVec2(0.0f, swatchH));
+                for (int i = 0; i < int(std::size(brackets)); ++i) {
+                    if (i > 0) ImGui::SameLine(0.0f, gap);
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX()
+                                       + (i == 0 ? 0.0f : 0.0f));
+                    ImGui::TextUnformatted(brackets[i].label);
+                }
+
+                ImGui::PushStyleColor(ImGuiCol_Text, IM_COL32(255, 180, 60, 255));
+                ImGui::TextWrapped("Disposition heuristic only — NOT a forecast.\n"
+                                   "Real decisions need the local avalanche bulletin\n"
+                                   "(SLF.ch, NWAC, etc.).");
+                ImGui::PopStyleColor();
+            }
+
+            ImGui::Separator();
             ImGui::TextUnformatted("Display");
             ImGui::SliderFloat("Exposure", &g_tone.exposure, 0.25f, 4.0f, "%.2f×");
             ImGui::SetItemTooltip("Linear multiplier before the ACES tonemap.\n"
@@ -2807,6 +2861,9 @@ int main(int argc, char** argv) {
         cam.satParams  = glm::vec4(g_sat.enabled    ? 1.0f : 0.0f,
                                    satImageReady    ? 1.0f : 0.0f,
                                    0.0f, 0.0f);
+        cam.avalancheParams = glm::vec4(g_avalanche.enabled                        ? 1.0f : 0.0f,
+                                        (g_avalanche.enabled && g_avalanche.solarLoading) ? 1.0f : 0.0f,
+                                        0.0f, 0.0f);
         cam.terrainAabb = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
                                     mesh.aabbMax.x, mesh.aabbMax.y);
         std::memcpy(cameraUbos[frameIndex].mapped, &cam, sizeof(cam));

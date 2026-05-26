@@ -124,6 +124,12 @@ Lives on the left side of the window. Sections from top to bottom:
 - **Sun hours / day**: enable a viridis colormap of accumulated direct sun
   for the selected date. Includes a legend strip, sample-step slider
   (coarser = faster recompute), and "top of scale" slider.
+- **Avalanche terrain (heuristic)**: enable an industry-standard slope-angle
+  ramp blended over the terrain (yellow 27–30° → orange → red → deep red →
+  dark purple up to 55°). Optional "solar loading" sub-toggle amplifies the
+  red on south-facing high-sun-hours slopes (wet-slide bias). Disposition
+  heuristic only — not a hazard forecast; the panel has a prominent
+  disclaimer.
 - **Display**: ACES exposure, satellite-albedo toggle (when imagery is
   bundled for the preset).
 - **Picked point**: appears once you right-click anywhere — lat/lon,
