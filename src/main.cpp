@@ -12,6 +12,9 @@
 #include "terrain_mesh.h"
 #include "sun_driver.h"
 #include "gpx.h"
+#include "presets.h"
+#include "app_state.h"
+#include "atmosphere.h"
 #include "device.h"        // forfun::createDevice / destroyDevice
 #include "swapchain.h"     // forfun::createSwapchain / destroySwapchain
 #include "frame_context.h" // forfun::createFrameContext / destroyFrameContext
@@ -30,14 +33,10 @@
 #include "terrain.vert.h"
 #include "terrain.frag.h"
 #include "terrain_depth.vert.h"
-#include "horizon_map.comp.h"
-#include "sun_hours.comp.h"
 #include "sky.vert.h"
 #include "sky.frag.h"
 #include "route.vert.h"
 #include "route.frag.h"
-#include "transmittance.comp.h"
-#include "sky_view.comp.h"
 
 #include <algorithm>
 #include <array>
@@ -74,175 +73,6 @@ struct alignas(16) CameraUBO {
     glm::vec4 cameraPos;             // world ENU camera position (.w unused), for aerial perspective
     glm::vec4 terrainAabb;           // .xy = (aabbMin.x, aabbMin.y), .zw = (aabbMax.x, aabbMax.y)
 };
-
-// Inputs to the SunDriver, owned by the UI. Defaults frame the Matterhorn
-// (45.976°N, 7.658°E) at local noon today (CEST = UTC+2 in late May 2026).
-struct SunUi {
-    float latDeg    = 45.976f;
-    float lonDeg    =  7.658f;
-    int   year      = 2026;
-    int   month     =    5;
-    int   day       =   25;
-    float localHour =   12.0f;
-    float tzOffsetH =    2.0f;
-};
-
-// Occlusion controls. Shadow map = sun-POV depth pass, sharp near-terrain
-// shadows but resolution-limited at this scale. Horizon map = per-texel
-// precomputed apparent-elevation profile, captures large-scale ridges at O(1)
-// per fragment; rebuilt only when the terrain changes (i.e. once at startup).
-//
-// Bias values forward straight to vkCmdSetDepthBias and only apply to the
-// shadow map. Resolution of the shadow map comes from kShadowMapSize in
-// forfun's types.h (currently 2048).
-struct ShadowUi {
-    bool  shadowMapEnabled  = true;
-    bool  horizonMapEnabled = true;
-    float depthBiasConstant = 1.25f;
-    float depthBiasSlope    = 2.50f;
-};
-
-// Horizon-map dimensions. Picked to balance memory + bake cost.
-//   512 × 512 × 32 × 2 bytes = 16 MB.
-constexpr uint32_t kHorizonMapSize = 512;
-constexpr uint32_t kHorizonBins    = 32;
-// Raymarch params (also used by the compute shader via push constants).
-constexpr float    kHorizonStepDistMeters = 150.0f;
-constexpr int      kHorizonMaxSteps       = 128;
-
-// Sun-hours-per-day visualisation. Output image matches the horizon map's
-// XY layout so the terrain frag can reuse the same UV mapping. Compute time
-// scales with kMaxSunSamples; 256 is comfortably enough for 5-min steps
-// across 24 h while keeping the UBO around 4 KB.
-constexpr uint32_t kSunHoursMapSize = 512;
-constexpr uint32_t kMaxSunSamples   = 256;
-
-// Hillaire-style atmosphere LUTs.
-//   Transmittance is one-shot at startup, never recomputed.
-//   Sky-view rebakes when the sun direction or observer altitude changes.
-constexpr uint32_t kTransmittanceLutW = 256;
-constexpr uint32_t kTransmittanceLutH = 64;
-constexpr uint32_t kSkyViewLutW       = 192;
-constexpr uint32_t kSkyViewLutH       = 108;
-
-struct SunHoursUi {
-    bool  enabled       = false;
-    float stepMinutes   = 10.0f;   // 144 samples/day at the default
-    float maxHoursScale = 14.0f;   // normalises the viridis colormap
-};
-
-struct ToneUi {
-    float exposure = 1.0f;
-};
-
-struct SatUi {
-    bool enabled = false;   // off by default — procedural shading is the demo look
-};
-
-// Avalanche terrain overlay. Heuristic colour map of slope-angle brackets
-// (industry standard ≈ 27–50° is "avalanche terrain"), optionally amplified
-// for south-facing high-sun-hours slopes (wet-slide bias). Off by default;
-// has a visible disclaimer in the UI that it is NOT a hazard forecast.
-struct AvalancheUi {
-    bool enabled       = false;
-    bool solarLoading  = true;   // checked by default once the overlay is on
-};
-
-// Loaded GPX route. CPU keeps waypoints + ENU vertices around so we can build
-// the waypoint sun-hours table; GPU holds a tightly-packed vertex buffer for
-// the line-strip draw. Lifted a few metres above the sampled DEM height so
-// the line floats above terrain instead of z-fighting it.
-constexpr float kRouteLiftMetres = 15.0f;
-struct Route {
-    std::string                file;        // source path (for the UI status line)
-    std::vector<gpx::Waypoint> waypoints;   // raw parser output (lat/lon/ele)
-    std::vector<glm::vec3>     enu;         // world-space positions, post-lift
-    std::vector<float>         sunHours;    // per-waypoint sun-hours/day (filled after bake)
-    Buffer                     vb;
-    uint32_t                   vertexCount = 0;
-    bool                       visible     = true;
-    float                      lengthKm    = 0.0f;
-};
-
-struct PendingGpxLoad {
-    std::string path;
-};
-
-// Right-click picking. Cleared once the readback completes.
-struct PickRequest {
-    bool pending = false;
-    int  pixelX  = 0;
-    int  pixelY  = 0;
-};
-// Last successful pick — persists in the ImGui panel until replaced.
-struct PickResult {
-    bool      valid     = false;
-    glm::vec3 worldPos  = glm::vec3(0.0f);
-    double    latDeg    = 0.0;
-    double    lonDeg    = 0.0;
-    float     elevation = 0.0f;
-    float     sunHours  = 0.0f;
-};
-
-// Hover sample — recomputed every frame via CPU ray-march against the DEM.
-// Cheap (~microseconds) so we don't need to gate it behind a click.
-struct HoverResult {
-    bool      valid     = false;
-    glm::vec3 worldPos  = glm::vec3(0.0f);
-    double    latDeg    = 0.0;
-    double    lonDeg    = 0.0;
-    float     elevation = 0.0f;
-    float     sunHours  = 0.0f;
-    double    cursorX   = 0.0;   // window pixels — used to place the tooltip
-    double    cursorY   = 0.0;
-};
-
-// Matches the sun_hours.comp UBO layout in std140. The trailing pad keeps
-// the struct size a multiple of 16 bytes so we can sizeof() it directly.
-struct alignas(16) SunSamplesUBO {
-    glm::vec4 dirs[kMaxSunSamples];
-    int       count;
-    float     hoursPerStep;
-    float     _pad0;
-    float     _pad1;
-};
-
-// Orbit camera: eye orbits around `target` on a sphere of radius `distance`.
-// yaw is the compass angle from +X (east) measured CCW around +Z; pitch is the
-// elevation angle above the horizontal plane through `target`.
-struct OrbitCamera {
-    glm::vec3 target      = glm::vec3(12000.0f, 53000.0f, 2500.0f);  // near Matterhorn
-    float     yaw         = -2.356f;   // ~-135°: camera SW of target
-    float     pitch       =  0.393f;   // ~22.5° above
-    float     distance    = 30000.0f;
-    float     minDistance =   500.0f;
-    float     maxDistance = 250000.0f;
-};
-
-struct InputState {
-    bool   leftDown      = false;
-    bool   middleDown    = false;
-    bool   rightDown     = false;
-    double lastX         = 0.0;
-    double lastY         = 0.0;
-    double scrollPending = 0.0;   // GLFW scroll deltas accumulate here; consumed each frame
-};
-
-// Globals so the GLFW scroll callback can reach them. We only ever have one
-// window in this process, so a singleton is fine.
-OrbitCamera g_camera;
-InputState  g_input;
-SunUi       g_sun;
-ShadowUi    g_shadow;
-SunHoursUi  g_sunHours;
-ToneUi      g_tone;
-AvalancheUi g_avalanche;
-PickRequest    g_pickRequest;
-PickResult     g_pickResult;
-HoverResult    g_hover;
-PendingGpxLoad g_pendingGpx;     // populated by the GLFW drop callback; consumed at top of loop
-Route          g_route;
-SatUi          g_sat;
 
 void scrollCallback(GLFWwindow* /*window*/, double /*xoffset*/, double yoffset) {
     // ImGui needs to see scroll over its widgets even though it installed its
@@ -332,29 +162,6 @@ float sampleDemBilinear(const dem::Tile& tile, double lon, double lat) {
          +         fy  * ((1.0f - fx) * v01 + fx * v11);
 }
 
-// Populates `route.sunHours` by looking up each waypoint's world-XY in the
-// CPU-side sun-hours grid. Cheap — one nearest-neighbour read per waypoint.
-void updateRouteSunHoursFromReadback(Route& route,
-                                     const float* sunHoursData,
-                                     int sunHoursSize,
-                                     const glm::vec3& aabbMin,
-                                     const glm::vec3& aabbMax) {
-    if (route.vertexCount == 0) {
-        route.sunHours.clear();
-        return;
-    }
-    const glm::vec2 extent(aabbMax.x - aabbMin.x, aabbMax.y - aabbMin.y);
-    route.sunHours.resize(route.vertexCount);
-    for (uint32_t i = 0; i < route.vertexCount; ++i) {
-        const glm::vec3& p = route.enu[i];
-        const float u = (p.x - aabbMin.x) / extent.x;
-        const float v = (aabbMax.y - p.y) / extent.y;       // N→S
-        const int x = std::clamp(int(u * sunHoursSize), 0, sunHoursSize - 1);
-        const int y = std::clamp(int(v * sunHoursSize), 0, sunHoursSize - 1);
-        route.sunHours[i] = sunHoursData[y * sunHoursSize + x];
-    }
-}
-
 // GLFW drop callback — runs on the main thread during glfwPollEvents. We
 // can't do GPU work here (no access to mesh/gpu) so we just record the path;
 // the per-frame loop consumes it before recording commands.
@@ -386,108 +193,10 @@ glm::vec3 viridisCpu(float t) {
     return c0 + t * (c1 + t * (c2 + t * (c3 + t * (c4 + t * (c5 + t * c6)))));
 }
 
-// Populates `out` with one calendar day's worth of sun directions, sampled
-// every `stepMinutes` from local midnight to midnight. Below-horizon samples
-// (.z < 0) are stored as-is — the compute shader filters them out per thread.
-// Returns the number of populated entries (clamped to kMaxSunSamples).
-int fillSunSamples(SunSamplesUBO& out, const SunUi& sun, float stepMinutes) {
-    const float clampedStep = std::max(1.0f, stepMinutes);
-    int stepsPerDay = static_cast<int>(std::ceil(24.0f * 60.0f / clampedStep));
-    if (stepsPerDay > static_cast<int>(kMaxSunSamples)) stepsPerDay = kMaxSunSamples;
-    const float hoursPerStep = 24.0f / static_cast<float>(stepsPerDay);
-    out.count        = stepsPerDay;
-    out.hoursPerStep = hoursPerStep;
-    out._pad0        = 0.0f;
-    out._pad1        = 0.0f;
-    for (int i = 0; i < stepsPerDay; ++i) {
-        const float localHour = (static_cast<float>(i) + 0.5f) * hoursPerStep;
-        const sun::Sample s   = sun::compute(sun.latDeg, sun.lonDeg,
-                                             sun.year, sun.month, sun.day,
-                                             localHour, sun.tzOffsetH);
-        out.dirs[i] = glm::vec4(s.directionToSun, 0.0f);
-    }
-    for (int i = stepsPerDay; i < static_cast<int>(kMaxSunSamples); ++i) {
-        out.dirs[i] = glm::vec4(0.0f);
-    }
-    return stepsPerDay;
-}
-
 struct LoadedTerrain {
     terrain::Mesh mesh;
     dem::Tile     tile;   // kept around so we can upload the heightmap to the GPU
 };
-
-// Built-in sample regions. Each entry names a Copernicus GLO-30 tile (downloaded
-// at configure time by CMake) and a lat/lon crop window within it. Mesh stride
-// is per-preset because cropped regions can afford finer mesh detail without
-// blowing up the vertex count.
-struct TerrainPreset {
-    const char* name;
-    const char* tilePath;       // path baked in by CMake
-    double      minLon, maxLon;
-    double      minLat, maxLat;
-    uint32_t    meshStride;     // stride=1 = full DEM detail, stride=8 = 1/64 verts
-    // Observer defaults: where the sun is computed from + local timezone.
-    // The camera also frames itself on this point at startup.
-    double      observerLat;
-    double      observerLon;
-    float       tzOffsetH;
-    float       camDistanceM;
-    // Optional GPX route auto-loaded with the preset. Toggleable in the UI
-    // via the standard "Show on terrain" checkbox; nullptr means no built-in.
-    const char* builtInGpxPath;
-    // Optional satellite-imagery JPEG (CMake-fetched ESRI World Imagery) used
-    // as terrain albedo when the user enables "Satellite mode". nullptr means
-    // satellite imagery is unavailable for this preset.
-    const char* satImagePath;
-    const char* description;
-};
-
-const TerrainPreset kPresets[] = {
-    // ~9 km × 10 km centred on Matterhorn (45.976°N, 7.658°E). The peak sits
-    // close to the north edge of the source GLO-30 tile (N45), so we can't
-    // extend much further north without stitching another tile in. Full
-    // DEM detail; CEST is UTC+2 (DST in late May). Auto-loads the Hörnli
-    // ridge route (hut → summit) as a built-in.
-    {"matterhorn", ALPINE_SUN_MATTERHORN_TILE_PATH,
-     7.60, 7.72, 45.91, 46.00, 1,
-     45.976, 7.658, 2.0f, 12000.0f,
-     ALPINE_SUN_ROUTE_MATTERHORN_HORNLI,
-     ALPINE_SUN_SAT_MATTERHORN_PATH,
-     "Matterhorn close-up (~9 km × 10 km) — full DEM detail"},
-    // The original wide preset: full 1° tile, stride=8 to keep the mesh tractable.
-    // No bundled satellite imagery; the area is too large for a single ESRI
-    // export to read sharply.
-    {"matterhorn-wide", ALPINE_SUN_MATTERHORN_TILE_PATH,
-     7.0, 8.0, 45.0, 46.0, 8,
-     45.976, 7.658, 2.0f, 30000.0f,
-     nullptr,
-     nullptr,
-     "Matterhorn region (1° × 1°, ~80 km × 110 km) — coarse mesh"},
-    // ~15 km × 10 km centred on Everest (27.988°N, 86.925°E). Includes Lhotse,
-    // Nuptse and the upper Khumbu icefall area. Same tile-edge constraint as
-    // Matterhorn: the summit is near the north edge of N27. Nepal Standard
-    // Time is UTC+5:45. Auto-loads the South-Col summit route (Camp 2 →
-    // Lhotse face → South Col → summit) as a built-in.
-    {"everest", ALPINE_SUN_EVEREST_TILE_PATH,
-     86.85, 87.00, 27.91, 28.00, 1,
-     27.988, 86.925, 5.75f, 14000.0f,
-     ALPINE_SUN_ROUTE_EVEREST_SUMMIT,
-     ALPINE_SUN_SAT_EVEREST_PATH,
-     "Mt Everest close-up (~15 km × 10 km) — full DEM detail"},
-};
-constexpr int kPresetCount = sizeof(kPresets) / sizeof(kPresets[0]);
-
-const TerrainPreset& findPresetOrDie(const char* name) {
-    for (const auto& p : kPresets) {
-        if (std::strcmp(p.name, name) == 0) return p;
-    }
-    std::fprintf(stderr, "alpine-sun: unknown terrain preset '%s'. Available:\n", name);
-    for (const auto& p : kPresets) {
-        std::fprintf(stderr, "  %-16s %s\n", p.name, p.description);
-    }
-    std::exit(EXIT_FAILURE);
-}
 
 LoadedTerrain loadAndBuildTerrain(const TerrainPreset& preset) {
     LoadedTerrain result;
@@ -533,20 +242,7 @@ LoadedTerrain loadAndBuildTerrain(const TerrainPreset& preset) {
 
 int main(int argc, char** argv) {
     // CLI: --terrain <name>. Default to the close Matterhorn view.
-    const char* presetName = "matterhorn";
-    for (int i = 1; i < argc; ++i) {
-        if (std::strcmp(argv[i], "--terrain") == 0 && i + 1 < argc) {
-            presetName = argv[++i];
-        } else if (std::strcmp(argv[i], "--help") == 0
-                || std::strcmp(argv[i], "-h") == 0) {
-            std::printf("Usage: alpine_sun [--terrain <name>]\n\nPresets:\n");
-            for (const auto& p : kPresets) {
-                std::printf("  %-16s %s\n", p.name, p.description);
-            }
-            return EXIT_SUCCESS;
-        }
-    }
-    const TerrainPreset& preset = findPresetOrDie(presetName);
+    const TerrainPreset& preset = resolveTerrainPreset(argc, argv);
 
     // Apply the preset's observer + camera defaults BEFORE loading so the
     // first sun-hours bake uses the right location/timezone.
@@ -636,93 +332,6 @@ int main(int argc, char** argv) {
         VK_CHECK(vkCreateSampler(gpu.device, &ci, nullptr, &shadowSampler));
     }
 
-    // ---- Heightmap texture (full-resolution DEM, R32F) ----
-    // Used only as input to the horizon-map compute bake — terrain rendering
-    // itself uses the prebaked mesh. Layout ends up SHADER_READ_ONLY_OPTIMAL.
-    VkImage         heightMapImage  = VK_NULL_HANDLE;
-    VkImageView     heightMapView   = VK_NULL_HANDLE;
-    VmaAllocation   heightMapAlloc  = VK_NULL_HANDLE;
-    VkSampler       heightMapSampler = VK_NULL_HANDLE;
-    {
-        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageCi.imageType     = VK_IMAGE_TYPE_2D;
-        imageCi.format        = VK_FORMAT_R32_SFLOAT;
-        imageCi.extent        = {tile.width, tile.height, 1};
-        imageCi.mipLevels     = 1;
-        imageCi.arrayLayers   = 1;
-        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
-        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        imageCi.usage         = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo allocCi{};
-        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
-        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
-                                &heightMapImage, &heightMapAlloc, nullptr));
-
-        VkImageViewCreateInfo viewCi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewCi.image            = heightMapImage;
-        viewCi.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-        viewCi.format           = VK_FORMAT_R32_SFLOAT;
-        viewCi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VK_CHECK(vkCreateImageView(gpu.device, &viewCi, nullptr, &heightMapView));
-
-        // Linear filter so the compute shader gets bilinear samples between
-        // DEM texels — modestly smoother bake than nearest.
-        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sCi.magFilter    = VK_FILTER_LINEAR;
-        sCi.minFilter    = VK_FILTER_LINEAR;
-        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &heightMapSampler));
-    }
-
-    // ---- Horizon map (R16F, 2D array, layer = azimuth bin) ----
-    // Storage-image-writable from the compute bake, then sampled by the
-    // terrain frag.
-    VkImage       horizonImage      = VK_NULL_HANDLE;
-    VkImageView   horizonSampleView = VK_NULL_HANDLE;  // sampled as array
-    VkImageView   horizonStorageView= VK_NULL_HANDLE;  // bound for write
-    VmaAllocation horizonAlloc      = VK_NULL_HANDLE;
-    VkSampler     horizonSampler    = VK_NULL_HANDLE;
-    {
-        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageCi.imageType     = VK_IMAGE_TYPE_2D;
-        imageCi.format        = VK_FORMAT_R16_SFLOAT;
-        imageCi.extent        = {kHorizonMapSize, kHorizonMapSize, 1};
-        imageCi.mipLevels     = 1;
-        imageCi.arrayLayers   = kHorizonBins;
-        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
-        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo allocCi{};
-        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
-        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
-                                &horizonImage, &horizonAlloc, nullptr));
-
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image            = horizonImage;
-        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-        vci.format           = VK_FORMAT_R16_SFLOAT;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, kHorizonBins};
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &horizonSampleView));
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &horizonStorageView));
-
-        // Linear filter for spatial XY, but layer (bin) sampling is always
-        // nearest in Vulkan — the frag shader manually interpolates between
-        // adjacent bins instead.
-        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sCi.magFilter    = VK_FILTER_LINEAR;
-        sCi.minFilter    = VK_FILTER_LINEAR;
-        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &horizonSampler));
-    }
-
     // ---- Transient pool for one-time uploads + depth transition ----
     VkCommandPool uploadPool = VK_NULL_HANDLE;
     {
@@ -783,66 +392,12 @@ int main(int argc, char** argv) {
     std::printf("gpu: terrain uploaded — VB %.1f MB, IB %.1f MB\n",
                 vbBytes / (1024.0 * 1024.0), ibBytes / (1024.0 * 1024.0));
 
-    // ---- Upload DEM as a sampled R32F texture (for horizon-map bake) ----
-    {
-        const VkDeviceSize demBytes =
-            static_cast<VkDeviceSize>(tile.width) * tile.height * sizeof(float);
-
-        VkBufferCreateInfo stagingCi{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-        stagingCi.size  = demBytes;
-        stagingCi.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-        VmaAllocationCreateInfo stagingAllocCi{};
-        stagingAllocCi.usage = VMA_MEMORY_USAGE_AUTO;
-        stagingAllocCi.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT
-                             | VMA_ALLOCATION_CREATE_MAPPED_BIT;
-        VkBuffer          stagingBuf  = VK_NULL_HANDLE;
-        VmaAllocation     stagingAlloc = VK_NULL_HANDLE;
-        VmaAllocationInfo stagingInfo{};
-        VK_CHECK(vmaCreateBuffer(gpu.allocator, &stagingCi, &stagingAllocCi,
-                                 &stagingBuf, &stagingAlloc, &stagingInfo));
-        std::memcpy(stagingInfo.pMappedData, tile.elevation.data(),
-                    static_cast<size_t>(demBytes));
-
-        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAi.commandPool        = uploadPool;
-        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAi.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-        transitionImage(cmd, heightMapImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
-
-        VkBufferImageCopy region{};
-        region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-        region.imageExtent      = {tile.width, tile.height, 1};
-        vkCmdCopyBufferToImage(cmd, stagingBuf, heightMapImage,
-                               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        transitionImage(cmd, heightMapImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-        VK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        sub.commandBufferCount = 1;
-        sub.pCommandBuffers    = &cmd;
-        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
-        vmaDestroyBuffer(gpu.allocator, stagingBuf, stagingAlloc);
-        std::printf("gpu: heightmap uploaded — %u x %u R32F (%.1f MB)\n",
-                    tile.width, tile.height, demBytes / (1024.0 * 1024.0));
-    }
+    // ---- Atmosphere subsystem (heightmap + horizon + sun-hours + LUTs) ----
+    // Owns the DEM upload, the horizon bake, the transmittance LUT bake, and
+    // the persistent sun-hours + sky-view compute pipelines. main() only
+    // touches it via the sample views (wired into terrain/sky descriptor sets)
+    // and via bakeSunHours / bakeSkyView when state changes.
+    AtmosphereSystem atm = createAtmosphereSystem(gpu, mesh, tile);
 
     // ---- Optional satellite imagery (terrain albedo override) ----
     // R8G8B8A8_SRGB so the sampler does sRGB→linear on read; ACES tonemap then
@@ -971,210 +526,6 @@ int main(int argc, char** argv) {
         }
     }
 
-    // ---- Bake horizon map (one-time compute dispatch) ----
-    // Build a self-contained compute pipeline + descriptor set, dispatch,
-    // tear it all down. The horizon image keeps its result in
-    // SHADER_READ_ONLY_OPTIMAL for the rest of the program.
-    {
-        VkDescriptorSetLayoutBinding bakeBindings[2]{};
-        bakeBindings[0].binding         = 0;
-        bakeBindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bakeBindings[0].descriptorCount = 1;
-        bakeBindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-        bakeBindings[1].binding         = 1;
-        bakeBindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bakeBindings[1].descriptorCount = 1;
-        bakeBindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslCi.bindingCount = 2;
-        dslCi.pBindings    = bakeBindings;
-        VkDescriptorSetLayout bakeSetLayout = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &bakeSetLayout));
-
-        VkDescriptorPoolSize bakePoolSizes[2]{};
-        bakePoolSizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bakePoolSizes[0].descriptorCount = 1;
-        bakePoolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bakePoolSizes[1].descriptorCount = 1;
-        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpCi.maxSets       = 1;
-        dpCi.poolSizeCount = 2;
-        dpCi.pPoolSizes    = bakePoolSizes;
-        VkDescriptorPool bakeDescPool = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &bakeDescPool));
-
-        VkDescriptorSet bakeDescSet = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool     = bakeDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &bakeSetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &bakeDescSet));
-
-        VkDescriptorImageInfo heightInfo{};
-        heightInfo.sampler     = heightMapSampler;
-        heightInfo.imageView   = heightMapView;
-        heightInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkDescriptorImageInfo horizonStoreInfo{};
-        horizonStoreInfo.imageView   = horizonStorageView;
-        horizonStoreInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet bakeWrites[2]{};
-        bakeWrites[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        bakeWrites[0].dstSet          = bakeDescSet;
-        bakeWrites[0].dstBinding      = 0;
-        bakeWrites[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bakeWrites[0].descriptorCount = 1;
-        bakeWrites[0].pImageInfo      = &heightInfo;
-        bakeWrites[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        bakeWrites[1].dstSet          = bakeDescSet;
-        bakeWrites[1].dstBinding      = 1;
-        bakeWrites[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bakeWrites[1].descriptorCount = 1;
-        bakeWrites[1].pImageInfo      = &horizonStoreInfo;
-        vkUpdateDescriptorSets(gpu.device, 2, bakeWrites, 0, nullptr);
-
-        VkPushConstantRange bakePush{};
-        bakePush.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        bakePush.size       = sizeof(glm::vec4) * 2;  // aabbMinMax + params
-
-        VkPipelineLayoutCreateInfo bakePlCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        bakePlCi.setLayoutCount         = 1;
-        bakePlCi.pSetLayouts            = &bakeSetLayout;
-        bakePlCi.pushConstantRangeCount = 1;
-        bakePlCi.pPushConstantRanges    = &bakePush;
-        VkPipelineLayout bakePipelineLayout = VK_NULL_HANDLE;
-        VK_CHECK(vkCreatePipelineLayout(gpu.device, &bakePlCi, nullptr, &bakePipelineLayout));
-
-        VkShaderModule bakeModule = createShaderModule(
-            gpu.device, horizon_map_comp_spv, sizeof(horizon_map_comp_spv));
-
-        VkPipelineShaderStageCreateInfo bakeStage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        bakeStage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        bakeStage.module = bakeModule;
-        bakeStage.pName  = "main";
-
-        VkComputePipelineCreateInfo bakeCpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        bakeCpCi.stage  = bakeStage;
-        bakeCpCi.layout = bakePipelineLayout;
-        VkPipeline bakePipeline = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &bakeCpCi, nullptr, &bakePipeline));
-        vkDestroyShaderModule(gpu.device, bakeModule, nullptr);
-
-        // Record + submit the bake.
-        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAi.commandPool        = uploadPool;
-        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAi.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-        transitionImageRange(cmd, horizonImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                             VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                             VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                             0, 1, 0, kHorizonBins);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, bakePipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                bakePipelineLayout, 0, 1, &bakeDescSet, 0, nullptr);
-
-        // Push constants: (aabbMin.x, aabbMin.y, aabbMax.x, aabbMax.y),
-        // (stepDistMeters, float(maxSteps), 0, 0).
-        struct {
-            glm::vec4 aabbMinMax;
-            glm::vec4 params;
-        } push{};
-        push.aabbMinMax = glm::vec4(mesh.aabbMin.x, mesh.aabbMin.y,
-                                    mesh.aabbMax.x, mesh.aabbMax.y);
-        push.params     = glm::vec4(kHorizonStepDistMeters,
-                                    static_cast<float>(kHorizonMaxSteps),
-                                    0.0f, 0.0f);
-        vkCmdPushConstants(cmd, bakePipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(push), &push);
-
-        const uint32_t groupsX = (kHorizonMapSize + 7) / 8;
-        const uint32_t groupsY = (kHorizonMapSize + 7) / 8;
-        vkCmdDispatch(cmd, groupsX, groupsY, kHorizonBins);
-
-        transitionImageRange(cmd, horizonImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                             VK_IMAGE_LAYOUT_GENERAL,
-                             VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                             VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                             VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                             VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                             VK_ACCESS_2_SHADER_SAMPLED_READ_BIT,
-                             0, 1, 0, kHorizonBins);
-
-        VK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        sub.commandBufferCount = 1;
-        sub.pCommandBuffers    = &cmd;
-        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-        vkFreeCommandBuffers(gpu.device, uploadPool, 1, &cmd);
-
-        vkDestroyPipeline(gpu.device, bakePipeline, nullptr);
-        vkDestroyPipelineLayout(gpu.device, bakePipelineLayout, nullptr);
-        vkDestroyDescriptorPool(gpu.device, bakeDescPool, nullptr);
-        vkDestroyDescriptorSetLayout(gpu.device, bakeSetLayout, nullptr);
-        std::printf("gpu: horizon map baked — %u² × %u bins, %.0fm step × %d steps\n",
-                    kHorizonMapSize, kHorizonBins,
-                    static_cast<double>(kHorizonStepDistMeters), kHorizonMaxSteps);
-    }
-
-    // ---- Sun-hours accumulator (single-layer R32F image) ----
-    VkImage         sunHoursImage      = VK_NULL_HANDLE;
-    VkImageView     sunHoursStorageView= VK_NULL_HANDLE;
-    VkImageView     sunHoursSampleView = VK_NULL_HANDLE;
-    VmaAllocation   sunHoursAlloc      = VK_NULL_HANDLE;
-    VkSampler       sunHoursSampler    = VK_NULL_HANDLE;
-    {
-        VkImageCreateInfo imageCi{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        imageCi.imageType     = VK_IMAGE_TYPE_2D;
-        imageCi.format        = VK_FORMAT_R32_SFLOAT;
-        imageCi.extent        = {kSunHoursMapSize, kSunHoursMapSize, 1};
-        imageCi.mipLevels     = 1;
-        imageCi.arrayLayers   = 1;
-        imageCi.samples       = VK_SAMPLE_COUNT_1_BIT;
-        imageCi.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        // TRANSFER_SRC so we can copy back to host every bake (waypoint table)
-        // and copy single texels for right-click sampling.
-        imageCi.usage         = VK_IMAGE_USAGE_STORAGE_BIT
-                              | VK_IMAGE_USAGE_SAMPLED_BIT
-                              | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
-        imageCi.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo allocCi{};
-        allocCi.usage = VMA_MEMORY_USAGE_AUTO;
-        VK_CHECK(vmaCreateImage(gpu.allocator, &imageCi, &allocCi,
-                                &sunHoursImage, &sunHoursAlloc, nullptr));
-
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image            = sunHoursImage;
-        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format           = VK_FORMAT_R32_SFLOAT;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &sunHoursStorageView));
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &sunHoursSampleView));
-
-        VkSamplerCreateInfo sCi{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sCi.magFilter    = VK_FILTER_LINEAR;
-        sCi.minFilter    = VK_FILTER_LINEAR;
-        sCi.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sCi.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sCi.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        VK_CHECK(vkCreateSampler(gpu.device, &sCi, nullptr, &sunHoursSampler));
-    }
-
-    // ---- SunSamples UBO (host-mapped — rewritten each recompute) ----
-    Buffer sunSamplesBuf = createBufferHostMapped(
-        gpu.allocator, sizeof(SunSamplesUBO), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT);
-
     // ---- Picking readback buffers ----
     // One float each: depth at cursor and sun-hours at picked texel. Host-mapped
     // so we can read straight from `mapped` after vkQueueWaitIdle.
@@ -1183,128 +534,10 @@ int main(int argc, char** argv) {
     Buffer pickHoursBuf = createBufferHostMapped(
         gpu.allocator, sizeof(float), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
 
-    // ---- Sun-hours full-texture readback (for waypoint table) ----
-    // 1 MB copy after every bake — populates a CPU-resident grid we can query
-    // at any (worldX, worldY) without round-tripping through Vulkan again.
-    const VkDeviceSize kSunHoursReadbackBytes =
-        static_cast<VkDeviceSize>(kSunHoursMapSize) * kSunHoursMapSize * sizeof(float);
-    Buffer sunHoursReadback = createBufferHostMapped(
-        gpu.allocator, kSunHoursReadbackBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-
-    // ---- Sun-hours compute pipeline (persistent — re-dispatched on date change) ----
-    VkDescriptorSetLayout sunHoursSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool      sunHoursDescPool  = VK_NULL_HANDLE;
-    VkDescriptorSet       sunHoursDescSet   = VK_NULL_HANDLE;
-    VkPipelineLayout      sunHoursPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            sunHoursPipeline       = VK_NULL_HANDLE;
-    {
-        VkDescriptorSetLayoutBinding bindings[3]{};
-        bindings[0].binding         = 0;
-        bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[1].binding         = 1;
-        bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[2].binding         = 2;
-        bindings[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        bindings[2].descriptorCount = 1;
-        bindings[2].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslCi.bindingCount = 3;
-        dslCi.pBindings    = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &sunHoursSetLayout));
-
-        VkDescriptorPoolSize poolSizes[3]{};
-        poolSizes[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        poolSizes[0].descriptorCount = 1;
-        poolSizes[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        poolSizes[1].descriptorCount = 1;
-        poolSizes[2].type            = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        poolSizes[2].descriptorCount = 1;
-        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpCi.maxSets       = 1;
-        dpCi.poolSizeCount = 3;
-        dpCi.pPoolSizes    = poolSizes;
-        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &sunHoursDescPool));
-
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool     = sunHoursDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &sunHoursSetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &sunHoursDescSet));
-
-        VkDescriptorImageInfo horizonReadInfo{};
-        horizonReadInfo.sampler     = horizonSampler;
-        horizonReadInfo.imageView   = horizonSampleView;
-        horizonReadInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkDescriptorImageInfo sunHoursStoreInfo{};
-        sunHoursStoreInfo.imageView   = sunHoursStorageView;
-        sunHoursStoreInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkDescriptorBufferInfo samplesInfo{};
-        samplesInfo.buffer = sunSamplesBuf.buffer;
-        samplesInfo.range  = sizeof(SunSamplesUBO);
-
-        VkWriteDescriptorSet writes[3]{};
-        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet          = sunHoursDescSet;
-        writes[0].dstBinding      = 0;
-        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[0].descriptorCount = 1;
-        writes[0].pImageInfo      = &horizonReadInfo;
-        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet          = sunHoursDescSet;
-        writes[1].dstBinding      = 1;
-        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[1].descriptorCount = 1;
-        writes[1].pImageInfo      = &sunHoursStoreInfo;
-        writes[2].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[2].dstSet          = sunHoursDescSet;
-        writes[2].dstBinding      = 2;
-        writes[2].descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
-        writes[2].descriptorCount = 1;
-        writes[2].pBufferInfo     = &samplesInfo;
-        vkUpdateDescriptorSets(gpu.device, 3, writes, 0, nullptr);
-
-        VkPushConstantRange pushRange{};
-        pushRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pushRange.size       = sizeof(glm::vec4);  // aabbMinMax
-
-        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plCi.setLayoutCount         = 1;
-        plCi.pSetLayouts            = &sunHoursSetLayout;
-        plCi.pushConstantRangeCount = 1;
-        plCi.pPushConstantRanges    = &pushRange;
-        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &sunHoursPipelineLayout));
-
-        VkShaderModule mod = createShaderModule(gpu.device,
-            sun_hours_comp_spv, sizeof(sun_hours_comp_spv));
-        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = mod;
-        stage.pName  = "main";
-        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpCi.stage  = stage;
-        cpCi.layout = sunHoursPipelineLayout;
-        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &sunHoursPipeline));
-        vkDestroyShaderModule(gpu.device, mod, nullptr);
-    }
-
-    // Dedicated transient pool for sun-hours bakes — survives the program's
-    // lifetime because we re-bake whenever the user changes date/location.
-    VkCommandPool sunHoursPool = VK_NULL_HANDLE;
-    {
-        VkCommandPoolCreateInfo poolCi{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-        poolCi.flags            = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT
-                                | VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        poolCi.queueFamilyIndex = gpu.graphicsFamily;
-        VK_CHECK(vkCreateCommandPool(gpu.device, &poolCi, nullptr, &sunHoursPool));
-    }
-
     // Tracks the parameter set baked last time so we only re-dispatch when
-    // something the bake depends on actually changed.
+    // something the bake depends on actually changed. Lives outside the
+    // AtmosphereSystem so the per-frame change-detection stays a pure
+    // main-loop concern.
     struct {
         float latDeg     = std::numeric_limits<float>::quiet_NaN();
         float lonDeg     = 0.0f;
@@ -1316,76 +549,7 @@ int main(int argc, char** argv) {
         bool initialized = false;
     } lastBakedParams;
 
-    // Runs the sun-hours compute. Synchronous (waits for the queue) — the
-    // dispatch is small enough (~few ms) that the brief stall is invisible.
-    auto runSunHoursBake = [&]() {
-        SunSamplesUBO* samples = static_cast<SunSamplesUBO*>(sunSamplesBuf.mapped);
-        const int n = fillSunSamples(*samples, g_sun, g_sunHours.stepMinutes);
-
-        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAi.commandPool        = sunHoursPool;
-        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAi.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-        // Discard previous contents (UNDEFINED) — we overwrite every texel.
-        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, sunHoursPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                sunHoursPipelineLayout, 0, 1, &sunHoursDescSet, 0, nullptr);
-
-        glm::vec4 push(mesh.aabbMin.x, mesh.aabbMin.y, mesh.aabbMax.x, mesh.aabbMax.y);
-        vkCmdPushConstants(cmd, sunHoursPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(push), &push);
-
-        const uint32_t groupsX = (kSunHoursMapSize + 7) / 8;
-        const uint32_t groupsY = (kSunHoursMapSize + 7) / 8;
-        vkCmdDispatch(cmd, groupsX, groupsY, 1);
-
-        // Copy the just-baked accumulator to a host-visible buffer so the
-        // route waypoint table can look up sun-hours per point without
-        // round-tripping the GPU again. We go through TRANSFER_SRC because
-        // imageStore writes need to be flushed before COPY can read them.
-        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COPY_BIT,
-                        VK_ACCESS_2_TRANSFER_READ_BIT);
-
-        VkBufferImageCopy rbRegion{};
-        rbRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        rbRegion.imageSubresource.layerCount = 1;
-        rbRegion.imageExtent = {kSunHoursMapSize, kSunHoursMapSize, 1};
-        vkCmdCopyImageToBuffer(cmd, sunHoursImage,
-                               VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                               sunHoursReadback.buffer, 1, &rbRegion);
-
-        transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_COPY_BIT,
-                        VK_ACCESS_2_TRANSFER_READ_BIT,
-                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-        VK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        sub.commandBufferCount = 1;
-        sub.pCommandBuffers    = &cmd;
-        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
-
+    auto rememberBakeParams = [&]() {
         lastBakedParams.latDeg      = g_sun.latDeg;
         lastBakedParams.lonDeg      = g_sun.lonDeg;
         lastBakedParams.year        = g_sun.year;
@@ -1394,292 +558,11 @@ int main(int argc, char** argv) {
         lastBakedParams.tzOffsetH   = g_sun.tzOffsetH;
         lastBakedParams.stepMin     = g_sunHours.stepMinutes;
         lastBakedParams.initialized = true;
-        std::printf("gpu: sun-hours baked — %d samples × %.1f h step\n",
-                    n, static_cast<double>(samples->hoursPerStep));
-
-        // Pull the freshly-baked accumulator into our route waypoint cache.
-        // Safe to read now — the queue wait above guarantees the copy has
-        // landed in sunHoursReadback.mapped.
-        updateRouteSunHoursFromReadback(
-            g_route,
-            static_cast<const float*>(sunHoursReadback.mapped),
-            int(kSunHoursMapSize),
-            mesh.aabbMin, mesh.aabbMax);
     };
 
     // Initial bake so the descriptor binding is always backed by valid data.
-    runSunHoursBake();
-
-    // =====================================================================
-    // Hillaire atmospheric LUTs
-    // =====================================================================
-    // ---- Transmittance LUT (R16G16B16A16F, 256×64) ----
-    VkImage       transImage      = VK_NULL_HANDLE;
-    VkImageView   transStorageView= VK_NULL_HANDLE;
-    VkImageView   transSampleView = VK_NULL_HANDLE;
-    VmaAllocation transAlloc      = VK_NULL_HANDLE;
-    VkSampler     transSampler    = VK_NULL_HANDLE;
-    {
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType     = VK_IMAGE_TYPE_2D;
-        ci.format        = VK_FORMAT_R16G16B16A16_SFLOAT;
-        ci.extent        = {kTransmittanceLutW, kTransmittanceLutH, 1};
-        ci.mipLevels     = 1;
-        ci.arrayLayers   = 1;
-        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo ac{};
-        ac.usage = VMA_MEMORY_USAGE_AUTO;
-        VK_CHECK(vmaCreateImage(gpu.allocator, &ci, &ac, &transImage, &transAlloc, nullptr));
-
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image            = transImage;
-        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format           = VK_FORMAT_R16G16B16A16_SFLOAT;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &transStorageView));
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &transSampleView));
-
-        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sci.magFilter    = VK_FILTER_LINEAR;
-        sci.minFilter    = VK_FILTER_LINEAR;
-        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        VK_CHECK(vkCreateSampler(gpu.device, &sci, nullptr, &transSampler));
-    }
-
-    // ---- Sky-view LUT (R16G16B16A16F, 192×108) ----
-    VkImage       skyViewImage      = VK_NULL_HANDLE;
-    VkImageView   skyViewStorageView= VK_NULL_HANDLE;
-    VkImageView   skyViewSampleView = VK_NULL_HANDLE;
-    VmaAllocation skyViewAlloc      = VK_NULL_HANDLE;
-    VkSampler     skyViewSampler    = VK_NULL_HANDLE;
-    {
-        VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
-        ci.imageType     = VK_IMAGE_TYPE_2D;
-        ci.format        = VK_FORMAT_R16G16B16A16_SFLOAT;
-        ci.extent        = {kSkyViewLutW, kSkyViewLutH, 1};
-        ci.mipLevels     = 1;
-        ci.arrayLayers   = 1;
-        ci.samples       = VK_SAMPLE_COUNT_1_BIT;
-        ci.tiling        = VK_IMAGE_TILING_OPTIMAL;
-        ci.usage         = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
-        ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        VmaAllocationCreateInfo ac{};
-        ac.usage = VMA_MEMORY_USAGE_AUTO;
-        VK_CHECK(vmaCreateImage(gpu.allocator, &ci, &ac, &skyViewImage, &skyViewAlloc, nullptr));
-
-        VkImageViewCreateInfo vci{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        vci.image            = skyViewImage;
-        vci.viewType         = VK_IMAGE_VIEW_TYPE_2D;
-        vci.format           = VK_FORMAT_R16G16B16A16_SFLOAT;
-        vci.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &skyViewStorageView));
-        VK_CHECK(vkCreateImageView(gpu.device, &vci, nullptr, &skyViewSampleView));
-
-        VkSamplerCreateInfo sci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
-        sci.magFilter    = VK_FILTER_LINEAR;
-        sci.minFilter    = VK_FILTER_LINEAR;
-        sci.mipmapMode   = VK_SAMPLER_MIPMAP_MODE_NEAREST;
-        sci.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;     // azimuth wraps
-        sci.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        sci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        VK_CHECK(vkCreateSampler(gpu.device, &sci, nullptr, &skyViewSampler));
-    }
-
-    // ---- Transmittance bake (one-shot at startup) ----
-    {
-        VkDescriptorSetLayoutBinding b{};
-        b.binding         = 0;
-        b.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        b.descriptorCount = 1;
-        b.stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslCi.bindingCount = 1;
-        dslCi.pBindings    = &b;
-        VkDescriptorSetLayout dsl = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &dsl));
-
-        VkDescriptorPoolSize ps{};
-        ps.type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        ps.descriptorCount = 1;
-        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpCi.maxSets       = 1;
-        dpCi.poolSizeCount = 1;
-        dpCi.pPoolSizes    = &ps;
-        VkDescriptorPool pool = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &pool));
-
-        VkDescriptorSet set = VK_NULL_HANDLE;
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool     = pool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &dsl;
-        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &set));
-
-        VkDescriptorImageInfo storeInfo{};
-        storeInfo.imageView   = transStorageView;
-        storeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet w{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        w.dstSet          = set;
-        w.dstBinding      = 0;
-        w.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        w.descriptorCount = 1;
-        w.pImageInfo      = &storeInfo;
-        vkUpdateDescriptorSets(gpu.device, 1, &w, 0, nullptr);
-
-        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plCi.setLayoutCount = 1;
-        plCi.pSetLayouts    = &dsl;
-        VkPipelineLayout plLayout = VK_NULL_HANDLE;
-        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &plLayout));
-
-        VkShaderModule mod = createShaderModule(gpu.device,
-            transmittance_comp_spv, sizeof(transmittance_comp_spv));
-        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = mod;
-        stage.pName  = "main";
-        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpCi.stage  = stage;
-        cpCi.layout = plLayout;
-        VkPipeline pipeline = VK_NULL_HANDLE;
-        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &pipeline));
-        vkDestroyShaderModule(gpu.device, mod, nullptr);
-
-        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAi.commandPool        = sunHoursPool;
-        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAi.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-        transitionImage(cmd, transImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                plLayout, 0, 1, &set, 0, nullptr);
-        vkCmdDispatch(cmd, (kTransmittanceLutW + 7) / 8, (kTransmittanceLutH + 7) / 8, 1);
-        transitionImage(cmd, transImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
-                            | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-        VK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        sub.commandBufferCount = 1;
-        sub.pCommandBuffers    = &cmd;
-        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
-
-        vkDestroyPipeline(gpu.device, pipeline, nullptr);
-        vkDestroyPipelineLayout(gpu.device, plLayout, nullptr);
-        vkDestroyDescriptorPool(gpu.device, pool, nullptr);
-        vkDestroyDescriptorSetLayout(gpu.device, dsl, nullptr);
-        std::printf("gpu: transmittance LUT baked — %u x %u RGBA16F\n",
-                    kTransmittanceLutW, kTransmittanceLutH);
-    }
-
-    // ---- Sky-view bake (persistent pipeline — rerun whenever sun moves) ----
-    VkDescriptorSetLayout skyViewSetLayout = VK_NULL_HANDLE;
-    VkDescriptorPool      skyViewDescPool  = VK_NULL_HANDLE;
-    VkDescriptorSet       skyViewDescSet   = VK_NULL_HANDLE;
-    VkPipelineLayout      skyViewPipelineLayout = VK_NULL_HANDLE;
-    VkPipeline            skyViewPipeline       = VK_NULL_HANDLE;
-    {
-        VkDescriptorSetLayoutBinding bindings[2]{};
-        bindings[0].binding         = 0;
-        bindings[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        bindings[0].descriptorCount = 1;
-        bindings[0].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-        bindings[1].binding         = 1;
-        bindings[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        bindings[1].descriptorCount = 1;
-        bindings[1].stageFlags      = VK_SHADER_STAGE_COMPUTE_BIT;
-
-        VkDescriptorSetLayoutCreateInfo dslCi{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-        dslCi.bindingCount = 2;
-        dslCi.pBindings    = bindings;
-        VK_CHECK(vkCreateDescriptorSetLayout(gpu.device, &dslCi, nullptr, &skyViewSetLayout));
-
-        VkDescriptorPoolSize ps[2]{};
-        ps[0].type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        ps[0].descriptorCount = 1;
-        ps[1].type            = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        ps[1].descriptorCount = 1;
-        VkDescriptorPoolCreateInfo dpCi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-        dpCi.maxSets       = 1;
-        dpCi.poolSizeCount = 2;
-        dpCi.pPoolSizes    = ps;
-        VK_CHECK(vkCreateDescriptorPool(gpu.device, &dpCi, nullptr, &skyViewDescPool));
-
-        VkDescriptorSetAllocateInfo ai{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
-        ai.descriptorPool     = skyViewDescPool;
-        ai.descriptorSetCount = 1;
-        ai.pSetLayouts        = &skyViewSetLayout;
-        VK_CHECK(vkAllocateDescriptorSets(gpu.device, &ai, &skyViewDescSet));
-
-        VkDescriptorImageInfo transInfo{};
-        transInfo.sampler     = transSampler;
-        transInfo.imageView   = transSampleView;
-        transInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-        VkDescriptorImageInfo storeInfo{};
-        storeInfo.imageView   = skyViewStorageView;
-        storeInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-        VkWriteDescriptorSet writes[2]{};
-        writes[0].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[0].dstSet          = skyViewDescSet;
-        writes[0].dstBinding      = 0;
-        writes[0].descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-        writes[0].descriptorCount = 1;
-        writes[0].pImageInfo      = &transInfo;
-        writes[1].sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[1].dstSet          = skyViewDescSet;
-        writes[1].dstBinding      = 1;
-        writes[1].descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
-        writes[1].descriptorCount = 1;
-        writes[1].pImageInfo      = &storeInfo;
-        vkUpdateDescriptorSets(gpu.device, 2, writes, 0, nullptr);
-
-        VkPushConstantRange pcr{};
-        pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-        pcr.size       = sizeof(glm::vec4) * 2;   // sunDir + observer params
-
-        VkPipelineLayoutCreateInfo plCi{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plCi.setLayoutCount         = 1;
-        plCi.pSetLayouts            = &skyViewSetLayout;
-        plCi.pushConstantRangeCount = 1;
-        plCi.pPushConstantRanges    = &pcr;
-        VK_CHECK(vkCreatePipelineLayout(gpu.device, &plCi, nullptr, &skyViewPipelineLayout));
-
-        VkShaderModule mod = createShaderModule(gpu.device,
-            sky_view_comp_spv, sizeof(sky_view_comp_spv));
-        VkPipelineShaderStageCreateInfo stage{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
-        stage.stage  = VK_SHADER_STAGE_COMPUTE_BIT;
-        stage.module = mod;
-        stage.pName  = "main";
-        VkComputePipelineCreateInfo cpCi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
-        cpCi.stage  = stage;
-        cpCi.layout = skyViewPipelineLayout;
-        VK_CHECK(vkCreateComputePipelines(gpu.device, VK_NULL_HANDLE, 1, &cpCi, nullptr, &skyViewPipeline));
-        vkDestroyShaderModule(gpu.device, mod, nullptr);
-    }
+    bakeSunHours(gpu, atm, g_sun, g_sunHours, g_route);
+    rememberBakeParams();
 
     // Sun direction that the sky-view LUT was last baked against. Compared
     // against each frame's current sun direction; the LUT rebakes when they
@@ -1687,67 +570,15 @@ int main(int argc, char** argv) {
     glm::vec3 lastSkyBakeSunDir(0.0f);
     bool      skyViewBaked = false;
 
-    auto runSkyViewBake = [&](const glm::vec3& sunDir, float observerAltM) {
-        // First bake transitions UNDEFINED → GENERAL; subsequent ones go from
-        // SHADER_READ_ONLY → GENERAL → SHADER_READ_ONLY.
-        VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-        cbAi.commandPool        = sunHoursPool;
-        cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-        cbAi.commandBufferCount = 1;
-        VkCommandBuffer cmd = VK_NULL_HANDLE;
-        VK_CHECK(vkAllocateCommandBuffers(gpu.device, &cbAi, &cmd));
-
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-        bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
-
-        // Discard previous contents — every texel is overwritten.
-        transitionImage(cmd, skyViewImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
-                        VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT, 0,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT);
-
-        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, skyViewPipeline);
-        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                skyViewPipelineLayout, 0, 1, &skyViewDescSet, 0, nullptr);
-
-        struct {
-            glm::vec4 sunDir;
-            glm::vec4 observer;
-        } push{};
-        push.sunDir   = glm::vec4(sunDir, 0.0f);
-        push.observer = glm::vec4(observerAltM, 0.0f, 0.0f, 0.0f);
-        vkCmdPushConstants(cmd, skyViewPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT,
-                           0, sizeof(push), &push);
-        vkCmdDispatch(cmd, (kSkyViewLutW + 7) / 8, (kSkyViewLutH + 7) / 8, 1);
-
-        transitionImage(cmd, skyViewImage, VK_IMAGE_ASPECT_COLOR_BIT,
-                        VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
-                        VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
-                        VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
-                        VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
-
-        VK_CHECK(vkEndCommandBuffer(cmd));
-        VkSubmitInfo sub{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-        sub.commandBufferCount = 1;
-        sub.pCommandBuffers    = &cmd;
-        VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
-        VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-        vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
-
-        lastSkyBakeSunDir = sunDir;
-        skyViewBaked      = true;
-    };
-
     // Initial sky-view bake using the preset's starting sun.
     {
         const sun::Sample s0 = sun::compute(
             g_sun.latDeg, g_sun.lonDeg,
             g_sun.year,   g_sun.month, g_sun.day,
             g_sun.localHour, g_sun.tzOffsetH);
-        runSkyViewBake(s0.directionToSun, mesh.aabbMax.z * 0.5f);
+        bakeSkyView(gpu, atm, s0.directionToSun, mesh.aabbMax.z * 0.5f);
+        lastSkyBakeSunDir = s0.directionToSun;
+        skyViewBaked      = true;
         std::printf("gpu: sky-view LUT baked — %u x %u RGBA16F\n",
                     kSkyViewLutW, kSkyViewLutH);
     }
@@ -1828,13 +659,13 @@ int main(int argc, char** argv) {
         shadowInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo horizonInfo{};
-        horizonInfo.sampler     = horizonSampler;
-        horizonInfo.imageView   = horizonSampleView;
+        horizonInfo.sampler     = atm.horizonSampler;
+        horizonInfo.imageView   = atm.horizonSampleView;
         horizonInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo sunHoursInfo{};
-        sunHoursInfo.sampler     = sunHoursSampler;
-        sunHoursInfo.imageView   = sunHoursSampleView;
+        sunHoursInfo.sampler     = atm.sunHoursSampler;
+        sunHoursInfo.imageView   = atm.sunHoursSampleView;
         sunHoursInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo satInfo{};
@@ -1843,8 +674,8 @@ int main(int argc, char** argv) {
         satInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkDescriptorImageInfo skyViewInfo{};
-        skyViewInfo.sampler     = skyViewSampler;
-        skyViewInfo.imageView   = skyViewSampleView;
+        skyViewInfo.sampler     = atm.skyViewSampler;
+        skyViewInfo.imageView   = atm.skyViewSampleView;
         skyViewInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
         VkWriteDescriptorSet writes[6]{};
@@ -2300,13 +1131,9 @@ int main(int argc, char** argv) {
 
         // Sun-hours per waypoint comes from the latest readback. We may not
         // have ever baked when --terrain switches and the user immediately
-        // drops a GPX, but sunHoursReadback is filled by the initial bake at
-        // startup so this is always valid.
-        updateRouteSunHoursFromReadback(
-            g_route,
-            static_cast<const float*>(sunHoursReadback.mapped),
-            int(kSunHoursMapSize),
-            mesh.aabbMin, mesh.aabbMax);
+        // drops a GPX, but the atmosphere readback is filled by the initial
+        // bake at startup so this is always valid.
+        updateRouteSunHoursFromAtmosphere(atm, g_route);
 
         std::printf("route: loaded %u waypoints, %.2f km from %s\n",
                     g_route.vertexCount, double(g_route.lengthKm), path.c_str());
@@ -2583,7 +1410,7 @@ int main(int argc, char** argv) {
                                                  0, int(kSunHoursMapSize) - 1);
                         const int y = std::clamp(int(v * kSunHoursMapSize),
                                                  0, int(kSunHoursMapSize) - 1);
-                        const float* data = static_cast<const float*>(sunHoursReadback.mapped);
+                        const float* data = static_cast<const float*>(atm.sunHoursReadback.mapped);
                         g_hover.sunHours = data[y * kSunHoursMapSize + x];
                     }
                 }
@@ -2823,7 +1650,8 @@ int main(int argc, char** argv) {
          || lastBakedParams.day       != g_sun.day
          || lastBakedParams.tzOffsetH != g_sun.tzOffsetH
          || lastBakedParams.stepMin   != g_sunHours.stepMinutes) {
-            runSunHoursBake();
+            bakeSunHours(gpu, atm, g_sun, g_sunHours, g_route);
+            rememberBakeParams();
         }
 
         // Sky-view rebake whenever the sun's direction drifts noticeably.
@@ -2831,7 +1659,9 @@ int main(int argc, char** argv) {
         // while keeping the sky in sync as the user scrubs time.
         const float skyDotLast = glm::dot(sunSample.directionToSun, lastSkyBakeSunDir);
         if (!skyViewBaked || skyDotLast < 0.99996f) {
-            runSkyViewBake(sunSample.directionToSun, mesh.aabbMax.z * 0.5f);
+            bakeSkyView(gpu, atm, sunSample.directionToSun, mesh.aabbMax.z * 0.5f);
+            lastSkyBakeSunDir = sunSample.directionToSun;
+            skyViewBaked      = true;
         }
 
         // ---- Camera matrices (sun fields) ----
@@ -3143,7 +1973,7 @@ int main(int argc, char** argv) {
 
                 // Tiny one-shot submit to copy that single texel.
                 VkCommandBufferAllocateInfo cbAi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-                cbAi.commandPool        = sunHoursPool;
+                cbAi.commandPool        = atm.bakePool;
                 cbAi.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
                 cbAi.commandBufferCount = 1;
                 VkCommandBuffer cmd = VK_NULL_HANDLE;
@@ -3153,7 +1983,7 @@ int main(int argc, char** argv) {
                 bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
                 VK_CHECK(vkBeginCommandBuffer(cmd, &bi));
 
-                transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                transitionImage(cmd, atm.sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
@@ -3166,11 +1996,11 @@ int main(int argc, char** argv) {
                 hRegion.imageSubresource.layerCount = 1;
                 hRegion.imageOffset = {texU, texV, 0};
                 hRegion.imageExtent = {1, 1, 1};
-                vkCmdCopyImageToBuffer(cmd, sunHoursImage,
+                vkCmdCopyImageToBuffer(cmd, atm.sunHoursImage,
                                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                        pickHoursBuf.buffer, 1, &hRegion);
 
-                transitionImage(cmd, sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
+                transitionImage(cmd, atm.sunHoursImage, VK_IMAGE_ASPECT_COLOR_BIT,
                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                 VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                                 VK_PIPELINE_STAGE_2_COPY_BIT,
@@ -3184,7 +2014,7 @@ int main(int argc, char** argv) {
                 sub.pCommandBuffers    = &cmd;
                 VK_CHECK(vkQueueSubmit(gpu.graphicsQueue, 1, &sub, VK_NULL_HANDLE));
                 VK_CHECK(vkQueueWaitIdle(gpu.graphicsQueue));
-                vkFreeCommandBuffers(gpu.device, sunHoursPool, 1, &cmd);
+                vkFreeCommandBuffers(gpu.device, atm.bakePool, 1, &cmd);
 
                 float hoursValue = 0.0f;
                 std::memcpy(&hoursValue, pickHoursBuf.mapped, sizeof(float));
@@ -3226,38 +2056,9 @@ int main(int argc, char** argv) {
     for (auto& b : cameraUbos) vmaDestroyBuffer(gpu.allocator, b.buffer, b.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainIB.buffer, terrainIB.allocation);
     vmaDestroyBuffer(gpu.allocator, terrainVB.buffer, terrainVB.allocation);
-    vkDestroyPipeline(gpu.device, skyViewPipeline, nullptr);
-    vkDestroyPipelineLayout(gpu.device, skyViewPipelineLayout, nullptr);
-    vkDestroyDescriptorPool(gpu.device, skyViewDescPool, nullptr);
-    vkDestroyDescriptorSetLayout(gpu.device, skyViewSetLayout, nullptr);
-    vkDestroySampler(gpu.device, skyViewSampler, nullptr);
-    vkDestroyImageView(gpu.device, skyViewSampleView, nullptr);
-    vkDestroyImageView(gpu.device, skyViewStorageView, nullptr);
-    vmaDestroyImage(gpu.allocator, skyViewImage, skyViewAlloc);
-    vkDestroySampler(gpu.device, transSampler, nullptr);
-    vkDestroyImageView(gpu.device, transSampleView, nullptr);
-    vkDestroyImageView(gpu.device, transStorageView, nullptr);
-    vmaDestroyImage(gpu.allocator, transImage, transAlloc);
-    vkDestroyCommandPool(gpu.device, sunHoursPool, nullptr);
-    vkDestroyPipeline(gpu.device, sunHoursPipeline, nullptr);
-    vkDestroyPipelineLayout(gpu.device, sunHoursPipelineLayout, nullptr);
-    vkDestroyDescriptorPool(gpu.device, sunHoursDescPool, nullptr);
-    vkDestroyDescriptorSetLayout(gpu.device, sunHoursSetLayout, nullptr);
-    vmaDestroyBuffer(gpu.allocator, sunHoursReadback.buffer, sunHoursReadback.allocation);
     vmaDestroyBuffer(gpu.allocator, pickHoursBuf.buffer, pickHoursBuf.allocation);
     vmaDestroyBuffer(gpu.allocator, pickDepthBuf.buffer, pickDepthBuf.allocation);
-    vmaDestroyBuffer(gpu.allocator, sunSamplesBuf.buffer, sunSamplesBuf.allocation);
-    vkDestroySampler(gpu.device, sunHoursSampler, nullptr);
-    vkDestroyImageView(gpu.device, sunHoursStorageView, nullptr);
-    vkDestroyImageView(gpu.device, sunHoursSampleView,  nullptr);
-    vmaDestroyImage(gpu.allocator, sunHoursImage, sunHoursAlloc);
-    vkDestroySampler(gpu.device, horizonSampler, nullptr);
-    vkDestroyImageView(gpu.device, horizonStorageView, nullptr);
-    vkDestroyImageView(gpu.device, horizonSampleView,  nullptr);
-    vmaDestroyImage(gpu.allocator, horizonImage, horizonAlloc);
-    vkDestroySampler(gpu.device, heightMapSampler, nullptr);
-    vkDestroyImageView(gpu.device, heightMapView, nullptr);
-    vmaDestroyImage(gpu.allocator, heightMapImage, heightMapAlloc);
+    destroyAtmosphereSystem(gpu, atm);
     vkDestroySampler(gpu.device, satSampler, nullptr);
     vkDestroyImageView(gpu.device, satView, nullptr);
     vmaDestroyImage(gpu.allocator, satImage, satAlloc);

@@ -183,6 +183,9 @@ add_executable(alpine_sun
     src/psa.cpp
     src/sun_driver.cpp
     src/gpx.cpp
+    src/presets.cpp
+    src/app_state.cpp
+    src/atmosphere.cpp
 )
 
 target_link_libraries(alpine_sun PRIVATE
